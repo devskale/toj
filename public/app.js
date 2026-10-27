@@ -397,9 +397,9 @@
               (note) => `
                 <div class="note-row" data-note-id="${escapeHtml(note.id)}">
                   <div class="note-row-content">
-                    <div class="note-row-title">${escapeHtml(note.title || "untitled")}</div>
+                    <div class="note-row-title">${note.pinned ? '<span class="note-badge">pinned</span> ' : ""}${escapeHtml(note.title || "untitled")}</div>
                     <div class="note-row-snippet">${escapeHtml(note.snippet || "Empty note")}</div>
-                    <div class="note-row-meta">${escapeHtml(formatDate(note.updatedAt))}</div>
+                    <div class="note-row-meta">${note.tags.length ? note.tags.map(t => '<span class="note-tag">' + escapeHtml(t) + '</span>').join(" ") : ""} ${escapeHtml(formatDate(note.updatedAt))}</div>
                   </div>
                   <jot-icon-button icon="trash" label="Delete note" class="note-delete-btn" data-note-id="${escapeHtml(note.id)}" danger></jot-icon-button>
                 </div>
@@ -436,6 +436,8 @@
     const commentFab = document.getElementById("commentFab");
     const previewFab = document.getElementById("previewFab");
     const previewCloseButton = document.getElementById("previewCloseButton");
+    const tagsInput = document.getElementById("tagsInput");
+    const pinButton = document.getElementById("pinButton");
 
     const refs = {
       previewScroll,
@@ -458,6 +460,8 @@
       commenterLabel,
       commentFab,
       previewFab,
+      tagsInput,
+      pinButton,
       previewCloseButton,
     };
 
@@ -586,6 +590,40 @@
             body: { title: titleInput.value },
           });
         }, 500);
+      });
+    }
+
+    if (tagsInput) {
+      let tagsSaveTimer = null;
+      tagsInput.addEventListener("input", () => {
+        if (!state.note) {
+          return;
+        }
+        clearTimeout(tagsSaveTimer);
+        tagsSaveTimer = setTimeout(async () => {
+          const tags = tagsInput.value
+            .split(/[\s,]+/)
+            .map((t) => t.trim())
+            .filter((t) => t.startsWith("#") && t.length > 1);
+          await api(`/api/notes/${noteId}`, {
+            method: "PUT",
+            body: { tags },
+          });
+        }, 500);
+      });
+    }
+
+    if (pinButton) {
+      pinButton.addEventListener("click", async () => {
+        if (!state.note) {
+          return;
+        }
+        const nextPinned = !state.note.pinned;
+        await api(`/api/notes/${noteId}`, {
+          method: "PUT",
+          body: { pinned: nextPinned },
+        });
+        pinButton.classList.toggle("pinned", nextPinned);
       });
     }
 
@@ -864,6 +902,12 @@
       if (refsArg.titleInput) {
         refsArg.titleInput.value = payload.note.title || "untitled";
       }
+      if (refsArg.tagsInput) {
+        refsArg.tagsInput.value = (payload.note.tags || []).join(" ");
+      }
+      if (refsArg.pinButton) {
+        refsArg.pinButton.classList.toggle("pinned", Boolean(payload.note.pinned));
+      }
       if (refsArg.editorTextarea) {
         refsArg.editorTextarea.value = payload.note.markdown || "";
       }
@@ -900,6 +944,10 @@
           <div class="topbar-left">
             <jot-icon-button icon="back" label="Back to notes" id="notesButton"></jot-icon-button>
             <input id="titleInput" class="title-input" type="text" spellcheck="false" value="untitled" />
+            <div class="tags-pin-bar" id="tagsPinBar">
+              <input id="tagsInput" class="tags-input" type="text" placeholder="#tag1 #tag2" spellcheck="false" />
+              <jot-icon-button icon="check" label="Pin" id="pinButton"></jot-icon-button>
+            </div>
             <span class="status-text" id="saveStatus"></span>
           </div>
           <div class="topbar-right">

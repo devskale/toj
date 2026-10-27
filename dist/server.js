@@ -95,8 +95,18 @@ function requireAuthRateLimit(req, res) {
     }
     return true;
 }
-app.use("/static", express_1.default.static(publicDir));
-app.use("/static/mermaid", express_1.default.static(node_path_1.default.join(node_path_1.default.resolve(__dirname, ".."), "node_modules", "mermaid", "dist")));
+app.use("/static", express_1.default.static(publicDir, {
+    etag: true,
+    lastModified: true,
+    maxAge: "1y",
+    immutable: true,
+}));
+app.use("/static/mermaid", express_1.default.static(node_path_1.default.join(node_path_1.default.resolve(__dirname, ".."), "node_modules", "mermaid", "dist"), {
+    etag: true,
+    lastModified: true,
+    maxAge: "1y",
+    immutable: true,
+}));
 app.get("/health", (_req, res) => {
     res.type("text/plain").send("ok");
 });
@@ -732,17 +742,25 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
     const titleProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "title");
     const markdownProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "markdown");
     const shareAccessProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "shareAccess");
+    const tagsProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "tags");
+    const pinnedProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "pinned");
     const currentMarkdown = (0, collab_js_1.collabToMarkdown)(note.collab);
     const nextTitle = titleProvided ? normalizeTitle(String(req.body.title || note.title)) : note.title;
     const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : currentMarkdown;
     const nextShareAccess = shareAccessProvided && ["none", "view", "comment", "edit"].includes(req.body.shareAccess)
         ? req.body.shareAccess
         : note.shareAccess;
+    const nextTags = tagsProvided ? (Array.isArray(req.body.tags) ? req.body.tags.map(String).filter(Boolean) : []) : note.tags;
+    const nextPinned = pinnedProvided ? Boolean(req.body.pinned) : note.pinned;
     const titleChanged = nextTitle !== note.title;
     const markdownChanged = nextMarkdown !== currentMarkdown;
     const shareAccessChanged = nextShareAccess !== note.shareAccess;
+    const tagsChanged = JSON.stringify(nextTags.sort()) !== JSON.stringify(note.tags.sort());
+    const pinnedChanged = nextPinned !== note.pinned;
     note.title = nextTitle;
     note.shareAccess = nextShareAccess;
+    note.tags = nextTags;
+    note.pinned = nextPinned;
     if (markdownChanged) {
         note.collab = (0, collab_js_1.collabFromMarkdown)(nextMarkdown, note.collab.serverCounter + 1);
     }
@@ -751,11 +769,11 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
     if (shareAccessChanged) {
         enforceShareAccessForConnections(note);
     }
-    if (titleChanged || markdownChanged || shareAccessChanged) {
+    if (titleChanged || markdownChanged || shareAccessChanged || tagsChanged || pinnedChanged) {
         broadcastEditorHello(note);
         broadcastNoteUpdate(note);
     }
-    res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess });
+    res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess, tags: note.tags, pinned: note.pinned });
 });
 app.get("/api/notes/:id/collab", requireOwnerApi, (req, res) => {
     const note = notes.get(String(req.params.id));
@@ -1423,6 +1441,8 @@ function loadNotesIntoMemory() {
         notes.set(id, {
             ...meta,
             shareAccess: meta.shareAccess || "none",
+            tags: meta.tags || [],
+            pinned: Boolean(meta.pinned),
             threads,
             collab,
             clientAcks: new Map(),
@@ -1462,6 +1482,8 @@ function createNote() {
         threads: [],
         collab: (0, collab_js_1.newCollabState)(),
         clientAcks: new Map(),
+        tags: [],
+        pinned: false,
     };
     notes.set(id, note);
     persistNote(note);
@@ -1538,6 +1560,8 @@ function persistNote(note, broadcastUpdate = true) {
         updatedAt: note.updatedAt,
         threads: note.threads,
         collab: (0, collab_js_1.saveCollabState)(note.collab),
+        tags: note.tags,
+        pinned: note.pinned,
     };
     node_fs_1.default.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
     writeJson(noteMetaPath(note.id), meta);
@@ -1558,14 +1582,24 @@ function persistNote(note, broadcastUpdate = true) {
 function searchNotes(query) {
     const needle = query.trim().toLowerCase();
     return Array.from(notes.values())
-        .map((note) => summarizeNote(note, needle))
         .filter((note) => {
         if (!needle) {
             return true;
         }
-        return note.title.toLowerCase().includes(needle) || note.snippet.toLowerCase().includes(needle);
+        const markdown = (0, collab_js_1.collabToMarkdown)(note.collab).toLowerCase();
+        const tagsMatch = note.tags.some((tag) => tag.toLowerCase().includes(needle));
+        const titleMatch = note.title.toLowerCase().includes(needle);
+        const contentMatch = markdown.includes(needle);
+        return titleMatch || contentMatch || tagsMatch || buildSnippet(note, needle).toLowerCase().includes(needle);
     })
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+        .map((note) => summarizeNote(note, needle))
+        .sort((a, b) => {
+        // Pinned notes first
+        if (a.pinned !== b.pinned) {
+            return b.pinned ? 1 : -1;
+        }
+        return b.updatedAt.localeCompare(a.updatedAt);
+    });
 }
 function summarizeNote(note, needle) {
     return {
@@ -1574,6 +1608,8 @@ function summarizeNote(note, needle) {
         updatedAt: note.updatedAt,
         shareId: note.shareId,
         snippet: buildSnippet(note, needle),
+        tags: note.tags,
+        pinned: note.pinned,
     };
 }
 function buildSnippet(note, needle) {
@@ -1667,6 +1703,8 @@ function serializeNoteForClient(note, req) {
             shareUrl: makeShareUrl(req, note.shareId),
             updatedAt: note.updatedAt,
             createdAt: note.createdAt,
+            tags: note.tags,
+            pinned: note.pinned,
         },
         viewer: buildViewerInfo(req),
         threads: serializeThreads(note, req),

@@ -70,6 +70,8 @@ type NoteMetaFile = {
   threads: CommentThread[];
   collab?: SavedCollabState;
   collabState?: SavedCollabState;
+  tags?: string[];
+  pinned?: boolean;
 };
 
 type NoteRecord = {
@@ -82,6 +84,8 @@ type NoteRecord = {
   threads: CommentThread[];
   collab: CollabState;
   clientAcks: Map<string, number>;
+  tags: string[];
+  pinned: boolean;
 };
 
 type NoteSummary = {
@@ -90,6 +94,8 @@ type NoteSummary = {
   updatedAt: string;
   shareId: string;
   snippet: string;
+  tags: string[];
+  pinned: boolean;
 };
 
 type DeviceToken = {
@@ -935,19 +941,26 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
   const titleProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "title");
   const markdownProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "markdown");
   const shareAccessProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "shareAccess");
+  const tagsProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "tags");
+  const pinnedProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "pinned");
   const currentMarkdown = collabToMarkdown(note.collab);
   const nextTitle = titleProvided ? normalizeTitle(String(req.body.title || note.title)) : note.title;
   const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : currentMarkdown;
   const nextShareAccess = shareAccessProvided && ["none", "view", "comment", "edit"].includes(req.body.shareAccess)
     ? (req.body.shareAccess as ShareAccess)
     : note.shareAccess;
+  const nextTags = tagsProvided ? (Array.isArray(req.body.tags) ? req.body.tags.map(String).filter(Boolean) : []) : note.tags;
+  const nextPinned = pinnedProvided ? Boolean(req.body.pinned) : note.pinned;
   const titleChanged = nextTitle !== note.title;
   const markdownChanged = nextMarkdown !== currentMarkdown;
-
   const shareAccessChanged = nextShareAccess !== note.shareAccess;
+  const tagsChanged = JSON.stringify(nextTags.sort()) !== JSON.stringify(note.tags.sort());
+  const pinnedChanged = nextPinned !== note.pinned;
 
   note.title = nextTitle;
   note.shareAccess = nextShareAccess;
+  note.tags = nextTags;
+  note.pinned = nextPinned;
   if (markdownChanged) {
     note.collab = collabFromMarkdown(nextMarkdown, note.collab.serverCounter + 1);
   }
@@ -956,11 +969,11 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
   if (shareAccessChanged) {
     enforceShareAccessForConnections(note);
   }
-  if (titleChanged || markdownChanged || shareAccessChanged) {
+  if (titleChanged || markdownChanged || shareAccessChanged || tagsChanged || pinnedChanged) {
     broadcastEditorHello(note);
     broadcastNoteUpdate(note);
   }
-  res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess });
+  res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess, tags: note.tags, pinned: note.pinned });
 });
 
 app.get("/api/notes/:id/collab", requireOwnerApi, (req, res) => {
@@ -1721,6 +1734,8 @@ function loadNotesIntoMemory() {
     notes.set(id, {
       ...meta,
       shareAccess: (meta.shareAccess as ShareAccess) || "none",
+      tags: meta.tags || [],
+      pinned: Boolean(meta.pinned),
       threads,
       collab,
       clientAcks: new Map(),
@@ -1763,6 +1778,8 @@ function createNote() {
     threads: [],
     collab: newCollabState(),
     clientAcks: new Map(),
+    tags: [],
+    pinned: false,
   };
 
   notes.set(id, note);
@@ -1849,6 +1866,8 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
     updatedAt: note.updatedAt,
     threads: note.threads,
     collab: saveCollabState(note.collab),
+    tags: note.tags,
+    pinned: note.pinned,
   };
 
   fs.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
@@ -1873,15 +1892,26 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
 function searchNotes(query: string) {
   const needle = query.trim().toLowerCase();
   return Array.from(notes.values())
-    .map((note) => summarizeNote(note, needle))
     .filter((note) => {
       if (!needle) {
         return true;
       }
 
-      return note.title.toLowerCase().includes(needle) || note.snippet.toLowerCase().includes(needle);
+      const markdown = collabToMarkdown(note.collab).toLowerCase();
+      const tagsMatch = note.tags.some((tag) => tag.toLowerCase().includes(needle));
+      const titleMatch = note.title.toLowerCase().includes(needle);
+      const contentMatch = markdown.includes(needle);
+
+      return titleMatch || contentMatch || tagsMatch || buildSnippet(note, needle).toLowerCase().includes(needle);
     })
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    .map((note) => summarizeNote(note, needle))
+    .sort((a, b) => {
+      // Pinned notes first
+      if (a.pinned !== b.pinned) {
+        return b.pinned ? 1 : -1;
+      }
+      return b.updatedAt.localeCompare(a.updatedAt);
+    });
 }
 
 function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
@@ -1891,6 +1921,8 @@ function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
     updatedAt: note.updatedAt,
     shareId: note.shareId,
     snippet: buildSnippet(note, needle),
+    tags: note.tags,
+    pinned: note.pinned,
   };
 }
 
@@ -1999,6 +2031,8 @@ function serializeNoteForClient(note: NoteRecord, req: Request) {
       shareUrl: makeShareUrl(req, note.shareId),
       updatedAt: note.updatedAt,
       createdAt: note.createdAt,
+      tags: note.tags,
+      pinned: note.pinned,
     },
     viewer: buildViewerInfo(req),
     threads: serializeThreads(note, req),
