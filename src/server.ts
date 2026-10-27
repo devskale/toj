@@ -235,8 +235,18 @@ function requireAuthRateLimit(req: Request, res: Response): boolean {
   return true;
 }
 
-app.use("/static", express.static(publicDir));
-app.use("/static/mermaid", express.static(path.join(path.resolve(__dirname, ".."), "node_modules", "mermaid", "dist")));
+app.use("/static", express.static(publicDir, {
+  etag: true,
+  lastModified: true,
+  maxAge: "1y",
+  immutable: true,
+}));
+app.use("/static/mermaid", express.static(path.join(path.resolve(__dirname, ".."), "node_modules", "mermaid", "dist"), {
+  etag: true,
+  lastModified: true,
+  maxAge: "1y",
+  immutable: true,
+}));
 
 app.get("/health", (_req, res) => {
   res.type("text/plain").send("ok");
