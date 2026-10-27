@@ -80,7 +80,6 @@ type NoteRecord = {
   createdAt: string;
   updatedAt: string;
   threads: CommentThread[];
-  markdown: string;
   collab: CollabState;
   clientAcks: Map<string, number>;
 };
@@ -311,7 +310,7 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
   }
 
   let workingCollab = note.collab;
-  let markdown = note.markdown;
+  let markdown = collabToMarkdown(workingCollab);
   let senderCounter = 0;
   const errors: string[] = [];
   const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
@@ -379,7 +378,6 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
   }
 
   note.collab = workingCollab;
-  note.markdown = markdown;
   note.updatedAt = nowIso();
   const titleChanged = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
     && normalizeTitle(String(req.body.title || note.title)) !== note.title;
@@ -396,7 +394,7 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
       senderId: "__api__",
       senderCounter,
       serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
+      markdown: collabToMarkdown(note.collab),
       idListUpdates,
     });
   }
@@ -419,15 +417,16 @@ app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
     return;
   }
 
-  const start = note.markdown.indexOf(quote);
+  const markdown = collabToMarkdown(note.collab);
+  const start = markdown.indexOf(quote);
   if (start === -1) {
     res.status(400).json({ ok: false, error: "Quoted text not found in note." });
     return;
   }
 
-  const prefix = note.markdown.slice(Math.max(0, start - 32), start);
+  const prefix = markdown.slice(Math.max(0, start - 32), start);
   const end = start + quote.length;
-  const suffix = note.markdown.slice(end, end + 32);
+  const suffix = markdown.slice(end, end + 32);
 
   const bearer = getBearerToken(req);
   const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
@@ -598,7 +597,7 @@ app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
   const limit = req.query.limit ? Number(req.query.limit) : null;
 
   if (offset !== null || limit !== null) {
-    const lines = note.markdown.split("\n");
+    const lines = collabToMarkdown(note.collab).split("\n");
     const start = Math.max(0, (offset || 1) - 1);
     const end = limit ? Math.min(lines.length, start + limit) : lines.length;
     const slice = lines.slice(start, end);
@@ -633,13 +632,14 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
   const titleProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "title");
   const markdownProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "markdown");
   const shareAccessProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "shareAccess");
+  const currentMarkdown = collabToMarkdown(note.collab);
   const nextTitle = titleProvided ? normalizeTitle(String(req.body.title || note.title)) : note.title;
-  const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : note.markdown;
+  const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : currentMarkdown;
   const nextShareAccess = shareAccessProvided && ["none", "view", "comment", "edit"].includes(req.body.shareAccess)
     ? (req.body.shareAccess as ShareAccess)
     : note.shareAccess;
   const titleChanged = nextTitle !== note.title;
-  const markdownChanged = nextMarkdown !== note.markdown;
+  const markdownChanged = nextMarkdown !== currentMarkdown;
 
   const shareAccessChanged = nextShareAccess !== note.shareAccess;
 
@@ -647,7 +647,6 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
   note.shareAccess = nextShareAccess;
   if (markdownChanged) {
     note.collab = collabFromMarkdown(nextMarkdown, note.collab.serverCounter + 1);
-    note.markdown = nextMarkdown;
   }
   note.updatedAt = nowIso();
   persistNote(note, false);
@@ -710,7 +709,7 @@ app.post("/api/share/:shareId/edit", (req, res) => {
   }
 
   let workingCollab = note.collab;
-  let markdown = note.markdown;
+  let markdown = collabToMarkdown(workingCollab);
   let senderCounter = 0;
   const errors: string[] = [];
   const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
@@ -778,7 +777,6 @@ app.post("/api/share/:shareId/edit", (req, res) => {
   }
 
   note.collab = workingCollab;
-  note.markdown = markdown;
   note.updatedAt = nowIso();
   persistNote(note, false);
 
@@ -788,7 +786,7 @@ app.post("/api/share/:shareId/edit", (req, res) => {
       senderId: "__api__",
       senderCounter,
       serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
+      markdown: collabToMarkdown(note.collab),
       idListUpdates,
     });
   }
@@ -819,7 +817,7 @@ app.get("/api/share/:shareId/note", (req, res) => {
     note: {
       id: note.id,
       title: note.title,
-      markdown: note.markdown,
+      markdown: collabToMarkdown(note.collab),
       shareAccess: note.shareAccess,
       updatedAt: note.updatedAt,
     },
@@ -1205,7 +1203,7 @@ function handleEditorMessage(conn: ClientConn, data: string) {
       senderId: mutationMsg.clientId,
       senderCounter,
       serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
+      markdown: collabToMarkdown(note.collab),
       idListUpdates: [],
     });
     return;
@@ -1227,14 +1225,13 @@ function handleEditorMessage(conn: ClientConn, data: string) {
       senderId: mutationMsg.clientId,
       senderCounter,
       serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
+      markdown: collabToMarkdown(note.collab),
       idListUpdates: [],
     });
     return;
   }
 
   note.collab = result.state;
-  note.markdown = result.markdown;
   note.updatedAt = nowIso();
   persistNote(note, false);
 
@@ -1243,7 +1240,7 @@ function handleEditorMessage(conn: ClientConn, data: string) {
     senderId: mutationMsg.clientId,
     senderCounter,
     serverCounter: note.collab.serverCounter,
-    markdown: note.markdown,
+    markdown: collabToMarkdown(note.collab),
     idListUpdates: result.idListUpdates,
   });
   broadcastNoteUpdate(note);
@@ -1263,7 +1260,7 @@ function buildHelloMessage(note: NoteRecord): ServerHelloMessage {
     noteId: note.id,
     title: note.title,
     shareId: note.shareId,
-    markdown: note.markdown,
+    markdown: collabToMarkdown(note.collab),
     idListState: saveCollabState(note.collab).idListState,
     serverCounter: note.collab.serverCounter,
   };
@@ -1420,7 +1417,6 @@ function loadNotesIntoMemory() {
     notes.set(id, {
       ...meta,
       shareAccess: (meta.shareAccess as ShareAccess) || "none",
-      markdown: collabToMarkdown(collab),
       threads,
       collab,
       clientAcks: new Map(),
@@ -1460,7 +1456,6 @@ function createNote() {
     shareAccess: "none",
     createdAt: timestamp,
     updatedAt: timestamp,
-    markdown: "",
     threads: [],
     collab: newCollabState(),
     clientAcks: new Map(),
@@ -1472,7 +1467,7 @@ function createNote() {
 }
 
 function persistNote(note: NoteRecord, broadcastUpdate = true) {
-  note.markdown = collabToMarkdown(note.collab);
+  const markdown = collabToMarkdown(note.collab);
 
   const meta: NoteMetaFile = {
     id: note.id,
@@ -1485,7 +1480,7 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
     collab: saveCollabState(note.collab),
   };
 
-  fs.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
+  fs.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
   writeJson(noteMetaPath(note.id), meta);
   if (broadcastUpdate) {
     broadcastNoteUpdate(note);
@@ -1517,7 +1512,7 @@ function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
 }
 
 function buildSnippet(note: NoteRecord, needle: string) {
-  const source = note.markdown.replace(/\s+/g, " ").trim();
+  const source = collabToMarkdown(note.collab).replace(/\s+/g, " ").trim();
   if (!source) {
     return "";
   }
@@ -1606,12 +1601,13 @@ function serializeThreads(note: NoteRecord, req: Request) {
 }
 
 function serializeNoteForClient(note: NoteRecord, req: Request) {
+  const markdown = collabToMarkdown(note.collab);
   return {
     note: {
       id: note.id,
       title: note.title,
-      markdown: note.markdown,
-      renderedHtml: renderMarkdown(note.markdown),
+      markdown,
+      renderedHtml: renderMarkdown(markdown),
       shareId: note.shareId,
       shareAccess: note.shareAccess,
       shareUrl: makeShareUrl(req, note.shareId),

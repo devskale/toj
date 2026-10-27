@@ -4,6 +4,7 @@ import {
   applyIdListUpdates,
   selectionFromIds,
   selectionToIds,
+  ElementIdGenerator,
 } from "./collab-shared.js";
 
 const PRESENCE_THROTTLE_MS = 80;
@@ -126,9 +127,12 @@ export function createCollabEditor(textarea, opts) {
   let nextClientCounter = 1;
   let clientId = null;
 
+  // Confirmed server state
   let serverState = { text: "", idList: new SimpleIdList() };
-  let currentState = { text: "", idList: new SimpleIdList() };
+  // Pending mutations sent but not yet acknowledged
   let pendingMutations = [];
+  // Current state = serverState + replayed pending
+  let currentState = { text: "", idList: new SimpleIdList() };
 
   // Remote presence
   const remoteCursors = new Map(); // clientId -> { name, color, selection, lastUpdate }
@@ -152,17 +156,11 @@ export function createCollabEditor(textarea, opts) {
     resizeObserver.observe(textarea);
   } catch {}
 
+  // Client-side ID generator
+  const idGenerator = new ElementIdGenerator(() => `${clientId}:${nextBunchIdCounter++}:${crypto.randomUUID()}`);
+
   function newId(before, idList, count = 1) {
-    if (clientId && before !== null && before.bunchId.startsWith(`${clientId}:`)) {
-      const maxCounter = idList.maxCounter(before.bunchId);
-      if (maxCounter === before.counter) {
-        return { bunchId: before.bunchId, counter: before.counter + 1 };
-      }
-    }
-    return {
-      bunchId: `${clientId}:${nextBunchIdCounter++}:${crypto.randomUUID()}`,
-      counter: 0,
-    };
+    return idGenerator.generateAfter(before, count);
   }
 
   // ---- Connection state ----
@@ -229,7 +227,7 @@ export function createCollabEditor(textarea, opts) {
   }
 
   function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   // ---- Presence sending ----
@@ -287,7 +285,11 @@ export function createCollabEditor(textarea, opts) {
       : null;
 
     if (msg.clientId) clientId = msg.clientId;
+    // Rebuild ID generator with our clientId
+    idGenerator.nextCounterMap.clear();
+
     serverState = { text: msg.markdown || "", idList: SimpleIdList.load(msg.idListState || []) };
+    // Replay mutations the server may not have received (lost in transit before a disconnect)
     currentState = replayPending(serverState, pendingMutations);
     initialized = true;
     setConnected(true);
@@ -303,13 +305,22 @@ export function createCollabEditor(textarea, opts) {
 
   function receiveMutation(msg) {
     if (!initialized) return;
+    // Save current selection in ID-space before updating
     const selIds = selectionToIds(currentState.idList, textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection || "none");
+
+    // 1. Apply server update to confirmed server state
     serverState = { text: msg.markdown || "", idList: applyIdListUpdates(serverState.idList, msg.idListUpdates || []) };
+
+    // 2. Drop acknowledged mutations if from us
     if (msg.senderId === clientId) {
-      const idx = pendingMutations.findIndex((m) => m.clientCounter === msg.senderCounter);
-      if (idx !== -1) pendingMutations = pendingMutations.slice(idx + 1);
+      const ackedUpTo = msg.senderCounter;
+      pendingMutations = pendingMutations.filter(m => m.clientCounter > ackedUpTo);
     }
+
+    // 3. Rebuild current state by replaying pending on top of confirmed server state
     currentState = replayPending(serverState, pendingMutations);
+
+    // 4. Restore selection using ID-based mapping
     render(selectionFromIds(selIds, currentState.idList));
     throttledPresence();
   }

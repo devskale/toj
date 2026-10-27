@@ -1,4 +1,4 @@
-(() => {
+(async () => {
   const ownerTokenKey = window.__OWNER_TOKEN_KEY__ || "md_owner_token";
   const app = document.getElementById("app");
   const page = document.body.dataset.page;
@@ -22,9 +22,9 @@
     + svgBtn('left', '<path d="M10 4l-4 4 4 4"/>') + svgBtn('reset', '<path d="M3.5 3v4h4"/><path d="M3.5 7a5.5 5.5 0 1 1 1 3.5"/>') + svgBtn('right', '<path d="M6 4l4 4-4 4"/>')
     + '<span></span>' + svgBtn('down', '<path d="M4 6l4 4 4-4"/>') + svgBtn('zoom-out', '<circle cx="8" cy="8" r="5.5"/><path d="M5.5 8h5"/>');
 
-  async function renderMermaid(container) {
+  const renderMermaid = (container) => {
     const m = window.__mermaid;
-    if (!m || !container) return;
+    if (!m || !container) return Promise.resolve();
     const freshNodes = Array.from(container.querySelectorAll("pre.mermaid")).filter((node) => node.textContent.trim());
 
     // Reuse cached wrappers for unchanged diagrams, preserving pan/zoom state
@@ -45,40 +45,45 @@
 
     if (toRender.length > 0) {
       const nodes = toRender.map((t) => t.node);
-      try { await m.run({ nodes, suppressErrors: true }); } catch {}
-      toRender.forEach(({ node, index }) => {
-        const wrap = document.createElement("div");
-        wrap.className = "mermaid-wrap";
-        const viewport = document.createElement("div");
-        viewport.className = "mermaid-viewport";
-        node.replaceWith(wrap);
-        viewport.appendChild(node);
-        wrap.appendChild(viewport);
-        const bar = document.createElement("div");
-        bar.className = "mermaid-toolbar";
-        bar.innerHTML = mermaidToolbarHtml;
-        wrap.appendChild(bar);
-        let scale = 1, tx = 0, ty = 0;
-        const step = 50;
-        function applyTransform() { node.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; }
-        bar.addEventListener("click", (e) => {
-          const btn = e.target.closest("[data-action]");
-          if (!btn) return;
-          const action = btn.dataset.action;
-          if (action === "zoom-in") { scale = Math.min(4, scale + 0.25); }
-          else if (action === "zoom-out") { scale = Math.max(0.25, scale - 0.25); }
-          else if (action === "up") { ty += step; }
-          else if (action === "down") { ty -= step; }
-          else if (action === "left") { tx += step; }
-          else if (action === "right") { tx -= step; }
-          else if (action === "reset") { scale = 1; tx = 0; ty = 0; }
-          applyTransform();
-        });
-        newCache[index] = { src: node.getAttribute("data-original-code"), wrap };
-      });
+      return m.run({ nodes, suppressErrors: true })
+        .then(() => {
+          toRender.forEach(({ node, index }) => {
+            const wrap = document.createElement("div");
+            wrap.className = "mermaid-wrap";
+            const viewport = document.createElement("div");
+            viewport.className = "mermaid-viewport";
+            node.replaceWith(wrap);
+            viewport.appendChild(node);
+            wrap.appendChild(viewport);
+            const bar = document.createElement("div");
+            bar.className = "mermaid-toolbar";
+            bar.innerHTML = mermaidToolbarHtml;
+            wrap.appendChild(bar);
+            let scale = 1, tx = 0, ty = 0;
+            const step = 50;
+            const applyTransform = () => { node.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+            bar.addEventListener("click", (e) => {
+              const btn = e.target.closest("[data-action]");
+              if (!btn) return;
+              const action = btn.dataset.action;
+              if (action === "zoom-in") { scale = Math.min(4, scale + 0.25); }
+              else if (action === "zoom-out") { scale = Math.max(0.25, scale - 0.25); }
+              else if (action === "up") { ty += step; }
+              else if (action === "down") { ty -= step; }
+              else if (action === "left") { tx += step; }
+              else if (action === "right") { tx -= step; }
+              else if (action === "reset") { scale = 1; tx = 0; ty = 0; }
+              applyTransform();
+            });
+            newCache[index] = { src: node.getAttribute("data-original-code"), wrap };
+          });
+          mermaidCache = newCache;
+        })
+        .catch(() => {});
     }
     mermaidCache = newCache;
-  }
+    return Promise.resolve();
+  };
   window.__renderMermaid = renderMermaid;
   window.__clearMermaidCache = () => { mermaidCache = []; };
 
@@ -633,6 +638,7 @@
         }
         initCollabEditor();
       } else {
+        // Public view/comment mode: legacy WebSocket for threads-updated + updated broadcasts
         if (shareAccess === "comment" && !payload.viewer.isOwner && !payload.viewer.commenterName) {
           openIdentityModal(refs, true);
         }
@@ -657,6 +663,7 @@
             reloadThreads(publicMode);
             return;
           }
+          // In public view mode, we still use the old 'updated' broadcast for preview refresh
           if (msg.type !== "updated") {
             return;
           }
@@ -697,6 +704,7 @@
           refsArg.topbarTitle.textContent = payload.note.title || "untitled";
         }
       } else {
+        // Owner editor: new collab-editor handles this, but we might get here during initial load
         if (state.saveStatus !== "Saving") {
           state.note.markdown = payload.note.markdown;
           state.note.title = payload.note.title;

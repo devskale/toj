@@ -14,59 +14,6 @@ exports.idBeforeIndex = idBeforeIndex;
 exports.applyClientMutations = applyClientMutations;
 const node_crypto_1 = __importDefault(require("node:crypto"));
 const articulated_1 = require("articulated");
-class TrackedIdList {
-    trackChanges;
-    _idList;
-    updates = [];
-    constructor(idList, trackChanges) {
-        this.trackChanges = trackChanges;
-        this._idList = idList;
-    }
-    get idList() {
-        return this._idList;
-    }
-    getAndResetUpdates() {
-        if (!this.trackChanges) {
-            throw new Error("trackChanges not enabled");
-        }
-        const updates = this.updates;
-        this.updates = [];
-        return updates;
-    }
-    insertAfter(before, newId, count = 1) {
-        this._idList = this._idList.insertAfter(before, newId, count);
-        if (this.trackChanges) {
-            this.updates.push({ type: "insertAfter", before, id: newId, count });
-        }
-    }
-    deleteRange(startIndex, endIndex) {
-        const ids = [];
-        for (let index = startIndex; index <= endIndex; index++) {
-            ids.push(this._idList.at(index));
-        }
-        for (const id of ids) {
-            this._idList = this._idList.delete(id);
-        }
-        if (this.trackChanges) {
-            this.updates.push({ type: "deleteRange", startIndex, endIndex });
-        }
-    }
-    apply(update) {
-        switch (update.type) {
-            case "insertAfter":
-                this._idList = this._idList.insertAfter(update.before, update.id, update.count);
-                return;
-            case "deleteRange":
-                this.deleteRange(update.startIndex, update.endIndex);
-                if (!this.trackChanges) {
-                    return;
-                }
-                this.updates.pop();
-                return;
-        }
-    }
-}
-exports.TrackedIdList = TrackedIdList;
 function charKey(id) {
     return `${id.bunchId}:${id.counter}`;
 }
@@ -155,6 +102,59 @@ function idBeforeIndex(state, index) {
     }
     return state.idList.at(index - 1);
 }
+class TrackedIdList {
+    trackChanges;
+    _idList;
+    updates = [];
+    constructor(idList, trackChanges) {
+        this.trackChanges = trackChanges;
+        this._idList = idList;
+    }
+    get idList() {
+        return this._idList;
+    }
+    getAndResetUpdates() {
+        if (!this.trackChanges) {
+            throw new Error("trackChanges not enabled");
+        }
+        const updates = this.updates;
+        this.updates = [];
+        return updates;
+    }
+    insertAfter(before, newId, count = 1) {
+        this._idList = this._idList.insertAfter(before, newId, count);
+        if (this.trackChanges) {
+            this.updates.push({ type: "insertAfter", before, id: newId, count });
+        }
+    }
+    deleteRange(startIndex, endIndex) {
+        const ids = [];
+        for (let index = startIndex; index <= endIndex; index++) {
+            ids.push(this._idList.at(index));
+        }
+        for (const id of ids) {
+            this._idList = this._idList.delete(id);
+        }
+        if (this.trackChanges) {
+            this.updates.push({ type: "deleteRange", startIndex, endIndex });
+        }
+    }
+    apply(update) {
+        switch (update.type) {
+            case "insertAfter":
+                this._idList = this._idList.insertAfter(update.before, update.id, update.count);
+                return;
+            case "deleteRange":
+                this.deleteRange(update.startIndex, update.endIndex);
+                if (!this.trackChanges) {
+                    return;
+                }
+                this.updates.pop();
+                return;
+        }
+    }
+}
+exports.TrackedIdList = TrackedIdList;
 function applyInsertMutation(trackedIds, chars, mutation) {
     const { before, id, content, isInWord } = mutation.args;
     if (!content) {

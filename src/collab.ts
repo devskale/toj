@@ -104,64 +104,7 @@ export type CollabState = {
   serverCounter: number;
 };
 
-export class TrackedIdList {
-  private _idList: IdList;
-  private updates: IdListUpdate[] = [];
-
-  constructor(idList: IdList, readonly trackChanges: boolean) {
-    this._idList = idList;
-  }
-
-  get idList(): IdList {
-    return this._idList;
-  }
-
-  getAndResetUpdates(): IdListUpdate[] {
-    if (!this.trackChanges) {
-      throw new Error("trackChanges not enabled");
-    }
-    const updates = this.updates;
-    this.updates = [];
-    return updates;
-  }
-
-  insertAfter(before: ElementId | null, newId: ElementId, count = 1) {
-    this._idList = this._idList.insertAfter(before, newId, count);
-    if (this.trackChanges) {
-      this.updates.push({ type: "insertAfter", before, id: newId, count });
-    }
-  }
-
-  deleteRange(startIndex: number, endIndex: number) {
-    const ids: ElementId[] = [];
-    for (let index = startIndex; index <= endIndex; index++) {
-      ids.push(this._idList.at(index));
-    }
-    for (const id of ids) {
-      this._idList = this._idList.delete(id);
-    }
-    if (this.trackChanges) {
-      this.updates.push({ type: "deleteRange", startIndex, endIndex });
-    }
-  }
-
-  apply(update: IdListUpdate) {
-    switch (update.type) {
-      case "insertAfter":
-        this._idList = this._idList.insertAfter(update.before, update.id, update.count);
-        return;
-      case "deleteRange":
-        this.deleteRange(update.startIndex, update.endIndex);
-        if (!this.trackChanges) {
-          return;
-        }
-        this.updates.pop();
-        return;
-    }
-  }
-}
-
-function charKey(id: ElementId) {
+function charKey(id: ElementId): string {
   return `${id.bunchId}:${id.counter}`;
 }
 
@@ -261,6 +204,63 @@ export function idBeforeIndex(state: CollabState, index: number): ElementId | nu
     return null;
   }
   return state.idList.at(index - 1);
+}
+
+export class TrackedIdList {
+  private _idList: IdList;
+  private updates: IdListUpdate[] = [];
+
+  constructor(idList: IdList, readonly trackChanges: boolean) {
+    this._idList = idList;
+  }
+
+  get idList(): IdList {
+    return this._idList;
+  }
+
+  getAndResetUpdates(): IdListUpdate[] {
+    if (!this.trackChanges) {
+      throw new Error("trackChanges not enabled");
+    }
+    const updates = this.updates;
+    this.updates = [];
+    return updates;
+  }
+
+  insertAfter(before: ElementId | null, newId: ElementId, count = 1) {
+    this._idList = this._idList.insertAfter(before, newId, count);
+    if (this.trackChanges) {
+      this.updates.push({ type: "insertAfter", before, id: newId, count });
+    }
+  }
+
+  deleteRange(startIndex: number, endIndex: number) {
+    const ids: ElementId[] = [];
+    for (let index = startIndex; index <= endIndex; index++) {
+      ids.push(this._idList.at(index));
+    }
+    for (const id of ids) {
+      this._idList = this._idList.delete(id);
+    }
+    if (this.trackChanges) {
+      this.updates.push({ type: "deleteRange", startIndex, endIndex });
+    }
+  }
+
+  apply(update: IdListUpdate) {
+    switch (update.type) {
+      case "insertAfter":
+        this._idList = this._idList.insertAfter(update.before, update.id, update.count);
+        return;
+      case "deleteRange":
+        this.deleteRange(update.startIndex, update.endIndex);
+        if (!this.trackChanges) {
+          return;
+        }
+        this.updates.pop();
+        return;
+    }
+  }
 }
 
 function applyInsertMutation(

@@ -171,7 +171,7 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
         return;
     }
     let workingCollab = note.collab;
-    let markdown = note.markdown;
+    let markdown = (0, collab_js_1.collabToMarkdown)(workingCollab);
     let senderCounter = 0;
     const errors = [];
     const idListUpdates = [];
@@ -229,7 +229,6 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
         return;
     }
     note.collab = workingCollab;
-    note.markdown = markdown;
     note.updatedAt = nowIso();
     const titleChanged = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
         && normalizeTitle(String(req.body.title || note.title)) !== note.title;
@@ -246,7 +245,7 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
             senderId: "__api__",
             senderCounter,
             serverCounter: note.collab.serverCounter,
-            markdown: note.markdown,
+            markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
             idListUpdates,
         });
     }
@@ -265,14 +264,15 @@ app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
         res.status(400).json({ ok: false, error: "quote and body are required." });
         return;
     }
-    const start = note.markdown.indexOf(quote);
+    const markdown = (0, collab_js_1.collabToMarkdown)(note.collab);
+    const start = markdown.indexOf(quote);
     if (start === -1) {
         res.status(400).json({ ok: false, error: "Quoted text not found in note." });
         return;
     }
-    const prefix = note.markdown.slice(Math.max(0, start - 32), start);
+    const prefix = markdown.slice(Math.max(0, start - 32), start);
     const end = start + quote.length;
-    const suffix = note.markdown.slice(end, end + 32);
+    const suffix = markdown.slice(end, end + 32);
     const bearer = getBearerToken(req);
     const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
     const authorName = apiKeyLabel || "Owner";
@@ -454,7 +454,7 @@ app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
     const offset = req.query.offset ? Number(req.query.offset) : null;
     const limit = req.query.limit ? Number(req.query.limit) : null;
     if (offset !== null || limit !== null) {
-        const lines = note.markdown.split("\n");
+        const lines = (0, collab_js_1.collabToMarkdown)(note.collab).split("\n");
         const start = Math.max(0, (offset || 1) - 1);
         const end = limit ? Math.min(lines.length, start + limit) : lines.length;
         const slice = lines.slice(start, end);
@@ -485,19 +485,19 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
     const titleProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "title");
     const markdownProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "markdown");
     const shareAccessProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "shareAccess");
+    const currentMarkdown = (0, collab_js_1.collabToMarkdown)(note.collab);
     const nextTitle = titleProvided ? normalizeTitle(String(req.body.title || note.title)) : note.title;
-    const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : note.markdown;
+    const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : currentMarkdown;
     const nextShareAccess = shareAccessProvided && ["none", "view", "comment", "edit"].includes(req.body.shareAccess)
         ? req.body.shareAccess
         : note.shareAccess;
     const titleChanged = nextTitle !== note.title;
-    const markdownChanged = nextMarkdown !== note.markdown;
+    const markdownChanged = nextMarkdown !== currentMarkdown;
     const shareAccessChanged = nextShareAccess !== note.shareAccess;
     note.title = nextTitle;
     note.shareAccess = nextShareAccess;
     if (markdownChanged) {
         note.collab = (0, collab_js_1.collabFromMarkdown)(nextMarkdown, note.collab.serverCounter + 1);
-        note.markdown = nextMarkdown;
     }
     note.updatedAt = nowIso();
     persistNote(note, false);
@@ -554,7 +554,7 @@ app.post("/api/share/:shareId/edit", (req, res) => {
         return;
     }
     let workingCollab = note.collab;
-    let markdown = note.markdown;
+    let markdown = (0, collab_js_1.collabToMarkdown)(workingCollab);
     let senderCounter = 0;
     const errors = [];
     const idListUpdates = [];
@@ -612,7 +612,6 @@ app.post("/api/share/:shareId/edit", (req, res) => {
         return;
     }
     note.collab = workingCollab;
-    note.markdown = markdown;
     note.updatedAt = nowIso();
     persistNote(note, false);
     if (idListUpdates.length > 0) {
@@ -621,7 +620,7 @@ app.post("/api/share/:shareId/edit", (req, res) => {
             senderId: "__api__",
             senderCounter,
             serverCounter: note.collab.serverCounter,
-            markdown: note.markdown,
+            markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
             idListUpdates,
         });
     }
@@ -650,7 +649,7 @@ app.get("/api/share/:shareId/note", (req, res) => {
         note: {
             id: note.id,
             title: note.title,
-            markdown: note.markdown,
+            markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
             shareAccess: note.shareAccess,
             updatedAt: note.updatedAt,
         },
@@ -975,7 +974,7 @@ function handleEditorMessage(conn, data) {
             senderId: mutationMsg.clientId,
             senderCounter,
             serverCounter: note.collab.serverCounter,
-            markdown: note.markdown,
+            markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
             idListUpdates: [],
         });
         return;
@@ -996,13 +995,12 @@ function handleEditorMessage(conn, data) {
             senderId: mutationMsg.clientId,
             senderCounter,
             serverCounter: note.collab.serverCounter,
-            markdown: note.markdown,
+            markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
             idListUpdates: [],
         });
         return;
     }
     note.collab = result.state;
-    note.markdown = result.markdown;
     note.updatedAt = nowIso();
     persistNote(note, false);
     broadcastEditorMutation(note, {
@@ -1010,7 +1008,7 @@ function handleEditorMessage(conn, data) {
         senderId: mutationMsg.clientId,
         senderCounter,
         serverCounter: note.collab.serverCounter,
-        markdown: note.markdown,
+        markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
         idListUpdates: result.idListUpdates,
     });
     broadcastNoteUpdate(note);
@@ -1026,7 +1024,7 @@ function buildHelloMessage(note) {
         noteId: note.id,
         title: note.title,
         shareId: note.shareId,
-        markdown: note.markdown,
+        markdown: (0, collab_js_1.collabToMarkdown)(note.collab),
         idListState: (0, collab_js_1.saveCollabState)(note.collab).idListState,
         serverCounter: note.collab.serverCounter,
     };
@@ -1177,7 +1175,6 @@ function loadNotesIntoMemory() {
         notes.set(id, {
             ...meta,
             shareAccess: meta.shareAccess || "none",
-            markdown: (0, collab_js_1.collabToMarkdown)(collab),
             threads,
             collab,
             clientAcks: new Map(),
@@ -1214,7 +1211,6 @@ function createNote() {
         shareAccess: "none",
         createdAt: timestamp,
         updatedAt: timestamp,
-        markdown: "",
         threads: [],
         collab: (0, collab_js_1.newCollabState)(),
         clientAcks: new Map(),
@@ -1224,7 +1220,7 @@ function createNote() {
     return note;
 }
 function persistNote(note, broadcastUpdate = true) {
-    note.markdown = (0, collab_js_1.collabToMarkdown)(note.collab);
+    const markdown = (0, collab_js_1.collabToMarkdown)(note.collab);
     const meta = {
         id: note.id,
         title: note.title,
@@ -1235,7 +1231,7 @@ function persistNote(note, broadcastUpdate = true) {
         threads: note.threads,
         collab: (0, collab_js_1.saveCollabState)(note.collab),
     };
-    node_fs_1.default.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
+    node_fs_1.default.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
     writeJson(noteMetaPath(note.id), meta);
     if (broadcastUpdate) {
         broadcastNoteUpdate(note);
@@ -1263,7 +1259,7 @@ function summarizeNote(note, needle) {
     };
 }
 function buildSnippet(note, needle) {
-    const source = note.markdown.replace(/\s+/g, " ").trim();
+    const source = (0, collab_js_1.collabToMarkdown)(note.collab).replace(/\s+/g, " ").trim();
     if (!source) {
         return "";
     }
@@ -1338,12 +1334,13 @@ function serializeThreads(note, req) {
     }));
 }
 function serializeNoteForClient(note, req) {
+    const markdown = (0, collab_js_1.collabToMarkdown)(note.collab);
     return {
         note: {
             id: note.id,
             title: note.title,
-            markdown: note.markdown,
-            renderedHtml: renderMarkdown(note.markdown),
+            markdown,
+            renderedHtml: renderMarkdown(markdown),
             shareId: note.shareId,
             shareAccess: note.shareAccess,
             shareUrl: makeShareUrl(req, note.shareId),
