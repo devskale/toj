@@ -183,6 +183,58 @@ const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+
+// ── Rate limiting (auth endpoints) ──
+
+type RateBucket = { count: number; resetAt: number };
+const authRateBuckets = new Map<string, RateBucket>();
+const AUTH_RATE_LIMIT = 5;        // attempts
+const AUTH_RATE_WINDOW_MS = 15 * 60 * 1000; // per 15 min
+const AUTH_RATE_BUCKETS_MAX = 10000;
+
+function rateLimitKey(req: Request): string {
+  return req.ip || req.socket.remoteAddress || "unknown";
+}
+
+function consumeAuthRate(req: Request): { allowed: boolean; retryAfterSeconds: number } {
+  const key = rateLimitKey(req);
+  const now = Date.now();
+
+  // Prune expired buckets opportunistically
+  if (authRateBuckets.size > AUTH_RATE_BUCKETS_MAX) {
+    for (const [k, bucket] of authRateBuckets) {
+      if (bucket.resetAt <= now) {
+        authRateBuckets.delete(k);
+      }
+    }
+  }
+
+  const bucket = authRateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    authRateBuckets.set(key, { count: 1, resetAt: now + AUTH_RATE_WINDOW_MS });
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+
+  bucket.count += 1;
+  if (bucket.count > AUTH_RATE_LIMIT) {
+    return { allowed: false, retryAfterSeconds: Math.ceil((bucket.resetAt - now) / 1000) };
+  }
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function requireAuthRateLimit(req: Request, res: Response): boolean {
+  const { allowed, retryAfterSeconds } = consumeAuthRate(req);
+  if (!allowed) {
+    res.setHeader("Retry-After", String(retryAfterSeconds));
+    res.status(429).json({
+      ok: false,
+      error: `Too many attempts. Try again in ${Math.ceil(retryAfterSeconds / 60)} minute(s).`,
+    });
+    return false;
+  }
+  return true;
+}
+
 app.use("/static", express.static(publicDir));
 app.use("/static/mermaid", express.static(path.join(path.resolve(__dirname, ".."), "node_modules", "mermaid", "dist")));
 
@@ -234,6 +286,9 @@ app.get("/api/viewer", (req, res) => {
 });
 
 app.post("/api/auth/setup", (req, res) => {
+  if (!requireAuthRateLimit(req, res)) {
+    return;
+  }
   if (authConfigured()) {
     res.status(400).json({ ok: false, error: "Password already configured." });
     return;
@@ -264,6 +319,9 @@ app.post("/api/auth/setup", (req, res) => {
 });
 
 app.post("/api/auth/login", (req, res) => {
+  if (!requireAuthRateLimit(req, res)) {
+    return;
+  }
   if (!authConfigured()) {
     res.status(400).json({ ok: false, error: "Password is not configured yet." });
     return;
@@ -425,6 +483,110 @@ app.delete("/api/keys/:id", requireOwnerApi, (req, res) => {
     return;
   }
   res.json({ ok: true });
+});
+
+app.post("/api/uploads", requireOwnerApi, (req, res) => {
+  const contentType = String(req.headers["content-type"] || "");
+  const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
+  const ALLOWED = new Map([
+    ["image/png", ".png"],
+    ["image/jpeg", ".jpg"],
+    ["image/gif", ".gif"],
+    ["image/webp", ".webp"],
+    ["image/svg+xml", ".svg"],
+  ]);
+
+  const ext = ALLOWED.get(contentType);
+  if (!ext) {
+    res.status(415).json({ ok: false, error: "Unsupported image type. Use PNG, JPEG, GIF, WebP or SVG." });
+    return;
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  req.on("data", (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > MAX_UPLOAD_BYTES) {
+      req.destroy();
+      res.status(413).json({ ok: false, error: "Image too large (max 10 MB)." });
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on("error", () => {
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: "Upload failed." });
+    }
+  });
+  req.on("end", () => {
+    const buffer = Buffer.concat(chunks);
+    if (buffer.length === 0) {
+      res.status(400).json({ ok: false, error: "Empty upload." });
+      return;
+    }
+    const id = `${createId(12)}${ext}`;
+    const uploadsDir = path.join(dataDir, "uploads");
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    fs.writeFileSync(path.join(uploadsDir, id), buffer);
+    res.json({ ok: true, url: `/uploads/${id}`, size: buffer.length });
+  });
+});
+
+app.use("/uploads", express.static(path.join(dataDir, "uploads"), { maxAge: "30d", immutable: true }));
+
+app.get("/api/notes/:id/history", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+  const snapshots = listHistorySnapshots(note.id).map((s) => ({
+    id: s.file.replace(/\.json$/, ""),
+    savedAt: s.savedAt,
+  }));
+  res.json({ ok: true, snapshots: snapshots.reverse() });
+});
+
+app.get("/api/notes/:id/history/:snapshotId", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+  const snapshotId = String(req.params.snapshotId).replace(/[^a-zA-Z0-9-]/g, "");
+  const file = path.join(noteHistoryDir(note.id), `${snapshotId}.json`);
+  if (!fs.existsSync(file)) {
+    res.status(404).json({ ok: false, error: "Snapshot not found." });
+    return;
+  }
+  const snapshot = readJson<{ savedAt?: string; title?: string } | null>(file, null);
+  const mdFile = path.join(noteHistoryDir(note.id), `${snapshotId}.md`);
+  const markdown = fs.existsSync(mdFile) ? fs.readFileSync(mdFile, "utf8") : "";
+  res.json({ ok: true, snapshot: { id: snapshotId, savedAt: snapshot?.savedAt, title: snapshot?.title, markdown } });
+});
+
+app.post("/api/notes/:id/history/:snapshotId/restore", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) {
+    res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+  const snapshotId = String(req.params.snapshotId).replace(/[^a-zA-Z0-9-]/g, "");
+  const mdFile = path.join(noteHistoryDir(note.id), `${snapshotId}.md`);
+  if (!fs.existsSync(mdFile)) {
+    res.status(404).json({ ok: false, error: "Snapshot not found." });
+    return;
+  }
+
+  // Snapshot the current state first so the restore is itself undoable
+  saveHistorySnapshot(note, "manual");
+
+  const markdown = fs.readFileSync(mdFile, "utf8");
+  note.collab = collabFromMarkdown(markdown, note.collab.serverCounter + 1);
+  note.updatedAt = nowIso();
+  persistNote(note, false);
+  broadcastEditorHello(note);
+  res.json({ ok: true, savedAt: note.updatedAt });
 });
 
 app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
@@ -1598,6 +1760,73 @@ function createNote() {
   return note;
 }
 
+// ── Note history (snapshots) ──
+
+const HISTORY_DIR = () => path.join(dataDir, "history");
+const HISTORY_MAX_PER_NOTE = 20;
+const HISTORY_MIN_INTERVAL_MS = 5 * 60 * 1000; // at most one snapshot per 5 min
+const noteHistoryCounters = new Map<string, { count: number; lastAt: number; markdown?: string }>();
+
+function noteHistoryDir(noteId: string) {
+  return path.join(HISTORY_DIR(), noteId);
+}
+
+function saveHistorySnapshot(note: NoteRecord, trigger: "interval" | "manual" | "restore") {
+  const now = Date.now();
+  const counter = noteHistoryCounters.get(note.id) || { count: 0, lastAt: 0 };
+
+  if (trigger === "interval") {
+    if (counter.count < 20 && now - counter.lastAt < HISTORY_MIN_INTERVAL_MS) {
+      return; // too soon since the last snapshot
+    }
+  }
+
+  const dir = noteHistoryDir(note.id);
+  fs.mkdirSync(dir, { recursive: true });
+
+  // Prune oldest snapshots beyond the cap
+  const existing = listHistorySnapshots(note.id);
+  while (existing.length >= HISTORY_MAX_PER_NOTE) {
+    const oldest = existing.shift();
+    if (!oldest) break;
+    try {
+      fs.rmSync(path.join(dir, oldest.file));
+      fs.rmSync(path.join(dir, oldest.file.replace(/\.json$/, ".md")), { force: true });
+    } catch {}
+  }
+
+  const stamp = `${String(now)}-${createId(4)}`;
+  const snapshot = {
+    id: note.id,
+    title: note.title,
+    createdAt: note.createdAt,
+    savedAt: nowIso(),
+    trigger,
+    threads: note.threads,
+    collab: saveCollabState(note.collab),
+  };
+  writeJson(path.join(dir, `${stamp}.json`), snapshot);
+  fs.writeFileSync(path.join(dir, `${stamp}.md`), collabToMarkdown(note.collab), "utf8");
+
+  noteHistoryCounters.set(note.id, { count: counter.count + 1, lastAt: now });
+}
+
+function listHistorySnapshots(noteId: string): { file: string; stamp: number; savedAt: string }[] {
+  const dir = noteHistoryDir(noteId);
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  return entries
+    .map((file) => {
+      const stamp = Number(file.split("-")[0]) || 0;
+      return { file, stamp, savedAt: new Date(stamp).toISOString() };
+    })
+    .sort((a, b) => a.stamp - b.stamp);
+}
+
 function persistNote(note: NoteRecord, broadcastUpdate = true) {
   const markdown = collabToMarkdown(note.collab);
 
@@ -1614,6 +1843,18 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
 
   fs.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
   writeJson(noteMetaPath(note.id), meta);
+
+  // Snapshot history when the content changed since the last snapshot
+  const last = noteHistoryCounters.get(note.id);
+  if (!last || last.markdown !== markdown) {
+    saveHistorySnapshot(note, "interval");
+    const updated = noteHistoryCounters.get(note.id);
+    if (updated) {
+      updated.markdown = markdown;
+      noteHistoryCounters.set(note.id, updated);
+    }
+  }
+
   if (broadcastUpdate) {
     broadcastNoteUpdate(note);
   }

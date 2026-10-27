@@ -463,6 +463,76 @@ export function createCollabEditor(textarea, opts) {
   textarea.addEventListener("blur", throttledPresence);
   textarea.addEventListener("scroll", renderRemoteCursors);
 
+  // ---- Image paste / drag-drop upload ----
+
+  async function uploadImage(file) {
+    const response = await fetch("/api/uploads", {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      credentials: "same-origin",
+      body: file,
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "Upload failed.");
+    }
+    return payload.url;
+  }
+
+  function insertMarkdownAtCursor(markdown) {
+    const ss = textarea.selectionStart;
+    const se = textarea.selectionEnd;
+    const mutations = [];
+    if (ss !== se) {
+      mutations.push(buildDeleteMutation(currentState, ss, se, nextClientCounter++));
+    }
+    mutations.push(buildInsertMutation(currentState, ss, markdown, nextClientCounter++, newId));
+    const sel = { start: ss + markdown.length, end: ss + markdown.length, direction: "none" };
+    applyLocalMutations(mutations, sel);
+  }
+
+  function handleImageFiles(files, preferredName) {
+    for (const file of files) {
+      if (!file.type.startsWith("image/")) continue;
+      const placeholder = `![uploading ${preferredName || file.name || "image"}…]()`;
+      insertMarkdownAtCursor(placeholder);
+      uploadImage(file)
+        .then((url) => {
+          // Replace the placeholder with the real URL via a text edit
+          const marker = placeholder;
+          const idx = currentState.text.indexOf(marker);
+          if (idx === -1) return;
+          const del = buildDeleteMutation(currentState, idx, idx + marker.length, nextClientCounter++);
+          const ins = buildInsertMutation(currentState, idx, `![](${url})`, nextClientCounter++, newId);
+          applyLocalMutations([del, ins], { start: idx + url.length + 5, end: idx + url.length + 5, direction: "none" });
+        })
+        .catch((error) => {
+          const idx = currentState.text.indexOf(placeholder);
+          if (idx !== -1) {
+            const del = buildDeleteMutation(currentState, idx, idx + placeholder.length, nextClientCounter++);
+            applyLocalMutations([del], { start: idx, end: idx, direction: "none" });
+          }
+          alert(error.message || "Image upload failed.");
+        });
+      return true;
+    }
+    return false;
+  }
+
+  textarea.addEventListener("paste", (event) => {
+    const files = Array.from(event.clipboardData?.files || []);
+    if (files.length > 0 && handleImageFiles(files)) {
+      event.preventDefault();
+    }
+  });
+
+  textarea.addEventListener("drop", (event) => {
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length > 0 && handleImageFiles(files)) {
+      event.preventDefault();
+    }
+  });
+
   connect();
 
   return {

@@ -54,6 +54,47 @@ const app = (0, express_1.default)();
 app.set("trust proxy", true);
 app.use(express_1.default.json({ limit: "2mb" }));
 app.use(express_1.default.urlencoded({ extended: true, limit: "2mb" }));
+const authRateBuckets = new Map();
+const AUTH_RATE_LIMIT = 5; // attempts
+const AUTH_RATE_WINDOW_MS = 15 * 60 * 1000; // per 15 min
+const AUTH_RATE_BUCKETS_MAX = 10000;
+function rateLimitKey(req) {
+    return req.ip || req.socket.remoteAddress || "unknown";
+}
+function consumeAuthRate(req) {
+    const key = rateLimitKey(req);
+    const now = Date.now();
+    // Prune expired buckets opportunistically
+    if (authRateBuckets.size > AUTH_RATE_BUCKETS_MAX) {
+        for (const [k, bucket] of authRateBuckets) {
+            if (bucket.resetAt <= now) {
+                authRateBuckets.delete(k);
+            }
+        }
+    }
+    const bucket = authRateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+        authRateBuckets.set(key, { count: 1, resetAt: now + AUTH_RATE_WINDOW_MS });
+        return { allowed: true, retryAfterSeconds: 0 };
+    }
+    bucket.count += 1;
+    if (bucket.count > AUTH_RATE_LIMIT) {
+        return { allowed: false, retryAfterSeconds: Math.ceil((bucket.resetAt - now) / 1000) };
+    }
+    return { allowed: true, retryAfterSeconds: 0 };
+}
+function requireAuthRateLimit(req, res) {
+    const { allowed, retryAfterSeconds } = consumeAuthRate(req);
+    if (!allowed) {
+        res.setHeader("Retry-After", String(retryAfterSeconds));
+        res.status(429).json({
+            ok: false,
+            error: `Too many attempts. Try again in ${Math.ceil(retryAfterSeconds / 60)} minute(s).`,
+        });
+        return false;
+    }
+    return true;
+}
 app.use("/static", express_1.default.static(publicDir));
 app.use("/static/mermaid", express_1.default.static(node_path_1.default.join(node_path_1.default.resolve(__dirname, ".."), "node_modules", "mermaid", "dist")));
 app.get("/health", (_req, res) => {
@@ -95,6 +136,9 @@ app.get("/api/viewer", (req, res) => {
     });
 });
 app.post("/api/auth/setup", (req, res) => {
+    if (!requireAuthRateLimit(req, res)) {
+        return;
+    }
     if (authConfigured()) {
         res.status(400).json({ ok: false, error: "Password already configured." });
         return;
@@ -119,6 +163,9 @@ app.post("/api/auth/setup", (req, res) => {
     res.json({ ok: true, token, ownerLocalStorageTokenKey });
 });
 app.post("/api/auth/login", (req, res) => {
+    if (!requireAuthRateLimit(req, res)) {
+        return;
+    }
     if (!authConfigured()) {
         res.status(400).json({ ok: false, error: "Password is not configured yet." });
         return;
@@ -263,6 +310,101 @@ app.delete("/api/keys/:id", requireOwnerApi, (req, res) => {
         return;
     }
     res.json({ ok: true });
+});
+app.post("/api/uploads", requireOwnerApi, (req, res) => {
+    const contentType = String(req.headers["content-type"] || "");
+    const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
+    const ALLOWED = new Map([
+        ["image/png", ".png"],
+        ["image/jpeg", ".jpg"],
+        ["image/gif", ".gif"],
+        ["image/webp", ".webp"],
+        ["image/svg+xml", ".svg"],
+    ]);
+    const ext = ALLOWED.get(contentType);
+    if (!ext) {
+        res.status(415).json({ ok: false, error: "Unsupported image type. Use PNG, JPEG, GIF, WebP or SVG." });
+        return;
+    }
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > MAX_UPLOAD_BYTES) {
+            req.destroy();
+            res.status(413).json({ ok: false, error: "Image too large (max 10 MB)." });
+            return;
+        }
+        chunks.push(chunk);
+    });
+    req.on("error", () => {
+        if (!res.headersSent) {
+            res.status(500).json({ ok: false, error: "Upload failed." });
+        }
+    });
+    req.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        if (buffer.length === 0) {
+            res.status(400).json({ ok: false, error: "Empty upload." });
+            return;
+        }
+        const id = `${createId(12)}${ext}`;
+        const uploadsDir = node_path_1.default.join(dataDir, "uploads");
+        node_fs_1.default.mkdirSync(uploadsDir, { recursive: true });
+        node_fs_1.default.writeFileSync(node_path_1.default.join(uploadsDir, id), buffer);
+        res.json({ ok: true, url: `/uploads/${id}`, size: buffer.length });
+    });
+});
+app.use("/uploads", express_1.default.static(node_path_1.default.join(dataDir, "uploads"), { maxAge: "30d", immutable: true }));
+app.get("/api/notes/:id/history", requireOwnerApi, (req, res) => {
+    const note = notes.get(String(req.params.id));
+    if (!note) {
+        res.status(404).json({ ok: false, error: "Note not found." });
+        return;
+    }
+    const snapshots = listHistorySnapshots(note.id).map((s) => ({
+        id: s.file.replace(/\.json$/, ""),
+        savedAt: s.savedAt,
+    }));
+    res.json({ ok: true, snapshots: snapshots.reverse() });
+});
+app.get("/api/notes/:id/history/:snapshotId", requireOwnerApi, (req, res) => {
+    const note = notes.get(String(req.params.id));
+    if (!note) {
+        res.status(404).json({ ok: false, error: "Note not found." });
+        return;
+    }
+    const snapshotId = String(req.params.snapshotId).replace(/[^a-zA-Z0-9-]/g, "");
+    const file = node_path_1.default.join(noteHistoryDir(note.id), `${snapshotId}.json`);
+    if (!node_fs_1.default.existsSync(file)) {
+        res.status(404).json({ ok: false, error: "Snapshot not found." });
+        return;
+    }
+    const snapshot = readJson(file, null);
+    const mdFile = node_path_1.default.join(noteHistoryDir(note.id), `${snapshotId}.md`);
+    const markdown = node_fs_1.default.existsSync(mdFile) ? node_fs_1.default.readFileSync(mdFile, "utf8") : "";
+    res.json({ ok: true, snapshot: { id: snapshotId, savedAt: snapshot?.savedAt, title: snapshot?.title, markdown } });
+});
+app.post("/api/notes/:id/history/:snapshotId/restore", requireOwnerApi, (req, res) => {
+    const note = notes.get(String(req.params.id));
+    if (!note) {
+        res.status(404).json({ ok: false, error: "Note not found." });
+        return;
+    }
+    const snapshotId = String(req.params.snapshotId).replace(/[^a-zA-Z0-9-]/g, "");
+    const mdFile = node_path_1.default.join(noteHistoryDir(note.id), `${snapshotId}.md`);
+    if (!node_fs_1.default.existsSync(mdFile)) {
+        res.status(404).json({ ok: false, error: "Snapshot not found." });
+        return;
+    }
+    // Snapshot the current state first so the restore is itself undoable
+    saveHistorySnapshot(note, "manual");
+    const markdown = node_fs_1.default.readFileSync(mdFile, "utf8");
+    note.collab = (0, collab_js_1.collabFromMarkdown)(markdown, note.collab.serverCounter + 1);
+    note.updatedAt = nowIso();
+    persistNote(note, false);
+    broadcastEditorHello(note);
+    res.json({ ok: true, savedAt: note.updatedAt });
 });
 app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
     const note = notes.get(String(req.params.id));
@@ -1325,6 +1467,66 @@ function createNote() {
     persistNote(note);
     return note;
 }
+// ── Note history (snapshots) ──
+const HISTORY_DIR = () => node_path_1.default.join(dataDir, "history");
+const HISTORY_MAX_PER_NOTE = 20;
+const HISTORY_MIN_INTERVAL_MS = 5 * 60 * 1000; // at most one snapshot per 5 min
+const noteHistoryCounters = new Map();
+function noteHistoryDir(noteId) {
+    return node_path_1.default.join(HISTORY_DIR(), noteId);
+}
+function saveHistorySnapshot(note, trigger) {
+    const now = Date.now();
+    const counter = noteHistoryCounters.get(note.id) || { count: 0, lastAt: 0 };
+    if (trigger === "interval") {
+        if (counter.count < 20 && now - counter.lastAt < HISTORY_MIN_INTERVAL_MS) {
+            return; // too soon since the last snapshot
+        }
+    }
+    const dir = noteHistoryDir(note.id);
+    node_fs_1.default.mkdirSync(dir, { recursive: true });
+    // Prune oldest snapshots beyond the cap
+    const existing = listHistorySnapshots(note.id);
+    while (existing.length >= HISTORY_MAX_PER_NOTE) {
+        const oldest = existing.shift();
+        if (!oldest)
+            break;
+        try {
+            node_fs_1.default.rmSync(node_path_1.default.join(dir, oldest.file));
+            node_fs_1.default.rmSync(node_path_1.default.join(dir, oldest.file.replace(/\.json$/, ".md")), { force: true });
+        }
+        catch { }
+    }
+    const stamp = `${String(now)}-${createId(4)}`;
+    const snapshot = {
+        id: note.id,
+        title: note.title,
+        createdAt: note.createdAt,
+        savedAt: nowIso(),
+        trigger,
+        threads: note.threads,
+        collab: (0, collab_js_1.saveCollabState)(note.collab),
+    };
+    writeJson(node_path_1.default.join(dir, `${stamp}.json`), snapshot);
+    node_fs_1.default.writeFileSync(node_path_1.default.join(dir, `${stamp}.md`), (0, collab_js_1.collabToMarkdown)(note.collab), "utf8");
+    noteHistoryCounters.set(note.id, { count: counter.count + 1, lastAt: now });
+}
+function listHistorySnapshots(noteId) {
+    const dir = noteHistoryDir(noteId);
+    let entries = [];
+    try {
+        entries = node_fs_1.default.readdirSync(dir).filter((f) => f.endsWith(".json"));
+    }
+    catch {
+        return [];
+    }
+    return entries
+        .map((file) => {
+        const stamp = Number(file.split("-")[0]) || 0;
+        return { file, stamp, savedAt: new Date(stamp).toISOString() };
+    })
+        .sort((a, b) => a.stamp - b.stamp);
+}
 function persistNote(note, broadcastUpdate = true) {
     const markdown = (0, collab_js_1.collabToMarkdown)(note.collab);
     const meta = {
@@ -1339,6 +1541,16 @@ function persistNote(note, broadcastUpdate = true) {
     };
     node_fs_1.default.writeFileSync(noteMarkdownPath(note.id), markdown, "utf8");
     writeJson(noteMetaPath(note.id), meta);
+    // Snapshot history when the content changed since the last snapshot
+    const last = noteHistoryCounters.get(note.id);
+    if (!last || last.markdown !== markdown) {
+        saveHistorySnapshot(note, "interval");
+        const updated = noteHistoryCounters.get(note.id);
+        if (updated) {
+            updated.markdown = markdown;
+            noteHistoryCounters.set(note.id, updated);
+        }
+    }
     if (broadcastUpdate) {
         broadcastNoteUpdate(note);
     }

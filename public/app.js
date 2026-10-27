@@ -499,6 +499,11 @@
       });
     }
 
+    const historyButton = document.getElementById("historyButton");
+    if (historyButton) {
+      historyButton.addEventListener("click", () => openHistoryModal(refs));
+    }
+
     if (resolvedButton) {
       resolvedButton.addEventListener("click", () => {
         state.showResolved = !state.showResolved;
@@ -899,6 +904,7 @@
           </div>
           <div class="topbar-right">
             <jot-icon-button icon="preview" label="Preview" id="previewFab"></jot-icon-button>
+            <jot-icon-button icon="undo" label="History" id="historyButton"></jot-icon-button>
             <jot-icon-button icon="copy" label="Copy note" id="copyButton"></jot-icon-button>
             <jot-icon-button icon="robot" label="Agent setup" id="agentButton"></jot-icon-button>
             <div class="share-popover-wrap" id="sharePopoverWrap">
@@ -911,6 +917,7 @@
         <main class="workspace">
           <section class="editor-pane">
             <div id="disconnectedBanner" class="editor-disconnected hidden">Disconnected. Reconnecting...</div>
+            <div class="modal-backdrop hidden" id="editorModalBackdrop"></div>
             <textarea id="editorTextarea" class="editor-textarea" spellcheck="false"></textarea>
           </section>
           <section class="preview-stage" id="previewStage">
@@ -996,6 +1003,7 @@
         <main class="workspace">
           <section class="editor-pane">
             <div id="disconnectedBanner" class="editor-disconnected hidden">Disconnected. Reconnecting...</div>
+            <div class="modal-backdrop hidden" id="editorModalBackdrop"></div>
             <textarea id="editorTextarea" class="editor-textarea" spellcheck="false"></textarea>
           </section>
           <section class="preview-stage" id="previewStage">
@@ -1071,6 +1079,92 @@
     });
     const closeHandler = (e) => { if (!popover.contains(e.target) && e.target.id !== "shareButton") { popover.classList.add("hidden"); document.removeEventListener("click", closeHandler); } };
     setTimeout(() => document.addEventListener("click", closeHandler), 0);
+  }
+
+  function openHistoryModal(refs) {
+    const noteId = state.note?.id;
+    if (!noteId) return;
+
+    const modalBackdrop = document.getElementById("editorModalBackdrop") || document.getElementById("listModalBackdrop");
+    if (!modalBackdrop) return;
+
+    modalBackdrop.classList.remove("hidden");
+    modalBackdrop.innerHTML = `
+      <div class="modal settings-modal" role="dialog" aria-modal="true">
+        <div class="settings-header">
+          <h2 class="settings-title">History</h2>
+          <jot-icon-button icon="close" label="Close" id="historyClose"></jot-icon-button>
+        </div>
+        <div class="settings-section">
+          <div id="historyList"><div class="api-keys-empty">Loading…</div></div>
+          <div id="historyPreview" style="display:none">
+            <h3 class="settings-section-title" style="margin-top:1rem">Preview</h3>
+            <pre id="historyPreviewText" style="max-height:300px;overflow:auto;white-space:pre-wrap;background:var(--hover-bg);padding:0.75rem;border-radius:8px;font-size:0.8rem"></pre>
+            <jot-button variant="primary" id="historyRestore">Restore this version</jot-button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const historyList = document.getElementById("historyList");
+    const historyPreview = document.getElementById("historyPreview");
+    const historyPreviewText = document.getElementById("historyPreviewText");
+    let selectedSnapshot = null;
+
+    function closeHistory() {
+      modalBackdrop.classList.add("hidden");
+      modalBackdrop.innerHTML = "";
+    }
+
+    document.getElementById("historyClose").addEventListener("click", closeHistory);
+    modalBackdrop.addEventListener("click", (e) => { if (e.target === modalBackdrop) closeHistory(); });
+
+    historyList.addEventListener("click", async (event) => {
+      const row = event.target.closest("[data-snapshot-id]");
+      if (!row) return;
+      selectedSnapshot = row.dataset.snapshotId;
+      historyList.querySelectorAll("[data-snapshot-id]").forEach((el) => el.style.background = "");
+      row.style.background = "var(--hover-bg)";
+      try {
+        const response = await api(`/api/notes/${noteId}/history/${selectedSnapshot}`);
+        historyPreviewText.textContent = response.snapshot.markdown || "(empty)";
+        historyPreview.style.display = "";
+      } catch (error) {
+        historyPreviewText.textContent = error.message || "Failed to load snapshot.";
+        historyPreview.style.display = "";
+      }
+    });
+
+    document.getElementById("historyRestore").addEventListener("click", async () => {
+      if (!selectedSnapshot) return;
+      if (!confirm("Restore this version? The current state is saved as a snapshot first (undoable).")) return;
+      try {
+        await api(`/api/notes/${noteId}/history/${selectedSnapshot}/restore`, { method: "POST" });
+        closeHistory();
+        window.location.reload();
+      } catch (error) {
+        alert(error.message || "Restore failed.");
+      }
+    });
+
+    (async () => {
+      try {
+        const response = await api(`/api/notes/${noteId}/history`);
+        if (!response.snapshots.length) {
+          historyList.innerHTML = '<div class="api-keys-empty">No snapshots yet. Snapshots are saved every 5 minutes while editing.</div>';
+          return;
+        }
+        historyList.innerHTML = response.snapshots.map((s) => `
+          <div class="api-key-row" data-snapshot-id="${escapeHtml(s.id)}" style="cursor:pointer">
+            <div class="api-key-info">
+              <span class="api-key-label">${escapeHtml(formatDate(s.savedAt))}</span>
+            </div>
+          </div>
+        `).join("");
+      } catch (error) {
+        historyList.innerHTML = `<div class="api-keys-empty">${escapeHtml(error.message || "Failed to load history.")}</div>`;
+      }
+    })();
   }
 
   function openAgentModal(refs) {
