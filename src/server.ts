@@ -94,6 +94,7 @@ type NoteSummary = {
 
 type DeviceToken = {
   id: string;
+  userId?: string;
   salt: string;
   hash: string;
   createdAt: string;
@@ -103,22 +104,38 @@ type DeviceToken = {
 type ApiKey = {
   id: string;
   label: string;
+  userId?: string;
   keySalt: string;
   keyHash: string;
   createdAt: string;
 };
 
-type AuthData = {
+type UserRole = "admin" | "editor";
+
+type UserRecord = {
+  id: string;
+  username: string;
   passwordSalt: string;
   passwordHash: string;
+  role: UserRole;
+  active: boolean;
+  createdAt: string;
+};
+
+type AuthData = {
+  passwordSalt?: string;
+  passwordHash?: string;
   tokens: DeviceToken[];
   apiKeys?: ApiKey[];
+  users?: UserRecord[];
 };
 
 type ViewerInfo = {
   isOwner: boolean;
   commenterName: string | null;
   hasCommenterIdentity: boolean;
+  username?: string | null;
+  role?: "admin" | "editor" | null;
 };
 
 function cliArg(name: string) {
@@ -222,6 +239,7 @@ app.post("/api/auth/setup", (req, res) => {
     return;
   }
 
+  const username = String(req.body.username || "admin").trim();
   const password = String(req.body.password || "");
   const confirmPassword = String(req.body.confirmPassword || "");
 
@@ -235,7 +253,13 @@ app.post("/api/auth/setup", (req, res) => {
     return;
   }
 
-  const token = initializeOwnerAuth(password);
+  const created = createUser(username, password, "admin");
+  if ("error" in created) {
+    res.status(400).json({ ok: false, error: created.error });
+    return;
+  }
+
+  const token = issueSessionToken(created.id);
   res.json({ ok: true, token, ownerLocalStorageTokenKey });
 });
 
@@ -245,14 +269,30 @@ app.post("/api/auth/login", (req, res) => {
     return;
   }
 
+  const username = String(req.body.username || "").trim();
   const password = String(req.body.password || "");
-  if (!passwordMatches(password)) {
-    res.status(401).json({ ok: false, error: "Wrong password." });
+
+  migrateLegacyAuthIfNeeded();
+
+  let user: UserRecord | null = null;
+  if (username) {
+    user = findUserByUsername(username);
+    if (user && !userPasswordMatches(user, password)) {
+      user = null;
+    }
+  } else {
+    // Legacy single-password login (no username field): match any user's password
+    const auth = loadAuthData();
+    user = (auth?.users || []).find((candidate) => userPasswordMatches(candidate, password)) || null;
+  }
+
+  if (!user || !user.active) {
+    res.status(401).json({ ok: false, error: "Wrong username or password." });
     return;
   }
 
-  const token = issueOwnerToken();
-  res.json({ ok: true, token, ownerLocalStorageTokenKey });
+  const token = issueSessionToken(user.id);
+  res.json({ ok: true, token, ownerLocalStorageTokenKey, username: user.username });
 });
 
 app.post("/api/auth/token", (req, res) => {
@@ -281,9 +321,100 @@ app.get("/api/keys", requireOwnerApi, (_req, res) => {
   res.json({ ok: true, keys: listApiKeys() });
 });
 
+// ── User management (admin only) ──
+
+app.get("/api/users", requireAdminApi, (_req, res) => {
+  const auth = loadAuthData();
+  const users = (auth?.users || []).map((user) => ({
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    active: user.active,
+    createdAt: user.createdAt,
+  }));
+  const identity = getRequestIdentity(_req);
+  res.json({ ok: true, users, me: identity.userId });
+});
+
+app.post("/api/users", requireAdminApi, (req, res) => {
+  const username = String(req.body.username || "");
+  const password = String(req.body.password || "");
+  const role = req.body.role === "admin" ? "admin" : "editor";
+  const created = createUser(username, password, role);
+  if ("error" in created) {
+    res.status(400).json({ ok: false, error: created.error });
+    return;
+  }
+  res.json({ ok: true, user: { id: created.id, username: created.username, role: created.role, active: created.active, createdAt: created.createdAt } });
+});
+
+app.post("/api/users/:id/password", requireAdminApi, (req, res) => {
+  const auth = loadAuthData();
+  const user = (auth?.users || []).find((u) => u.id === String(req.params.id));
+  if (!user) {
+    res.status(404).json({ ok: false, error: "User not found." });
+    return;
+  }
+  const password = String(req.body.password || "");
+  if (password.length < 8) {
+    res.status(400).json({ ok: false, error: "Password must be at least 8 characters." });
+    return;
+  }
+  const salt = crypto.randomBytes(16).toString("hex");
+  user.passwordSalt = salt;
+  user.passwordHash = hashSecret(password, salt);
+  saveAuthData(auth as AuthData);
+  revokeUserSessions(user.id);
+  res.json({ ok: true });
+});
+
+app.post("/api/users/:id/active", requireAdminApi, (req, res) => {
+  const auth = loadAuthData();
+  const user = (auth?.users || []).find((u) => u.id === String(req.params.id));
+  if (!user) {
+    res.status(404).json({ ok: false, error: "User not found." });
+    return;
+  }
+  const active = Boolean(req.body.active);
+  const identity = getRequestIdentity(req);
+  if (user.id === identity.userId && !active) {
+    res.status(400).json({ ok: false, error: "Cannot deactivate your own account." });
+    return;
+  }
+  user.active = active;
+  saveAuthData(auth as AuthData);
+  if (!active) {
+    revokeUserSessions(user.id);
+  }
+  res.json({ ok: true, active: user.active });
+});
+
+app.delete("/api/users/:id", requireAdminApi, (req, res) => {
+  const auth = loadAuthData();
+  if (!auth?.users) {
+    res.status(404).json({ ok: false, error: "User not found." });
+    return;
+  }
+  const identity = getRequestIdentity(req);
+  if (req.params.id === identity.userId) {
+    res.status(400).json({ ok: false, error: "Cannot delete your own account." });
+    return;
+  }
+  const before = auth.users.length;
+  auth.users = auth.users.filter((u) => u.id !== String(req.params.id));
+  if (auth.users.length === before) {
+    res.status(404).json({ ok: false, error: "User not found." });
+    return;
+  }
+  saveAuthData(auth);
+  revokeUserSessions(String(req.params.id));
+  res.json({ ok: true });
+});
+
 app.post("/api/keys", requireOwnerApi, (req, res) => {
   const label = String(req.body.label || "unnamed");
-  const result = createApiKey(label);
+  const identity = getRequestIdentity(req);
+  const result = createApiKey(label, identity.userId);
   res.json({ ok: true, ...result });
 });
 
@@ -428,9 +559,9 @@ app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
   const end = start + quote.length;
   const suffix = markdown.slice(end, end + 32);
 
-  const bearer = getBearerToken(req);
-  const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
-  const authorName = apiKeyLabel || "Owner";
+  const identity = getRequestIdentity(req);
+  const authorName = identity.username || "Owner";
+  const authorId = identity.userId || "__owner__";
 
   const anchor: CommentAnchor = { quote, prefix, suffix, start, end };
   const thread: CommentThread = {
@@ -443,7 +574,7 @@ app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
       {
         id: createId(10),
         parentId: null,
-        authorId: "__owner__",
+        authorId,
         authorName,
         body,
         createdAt: nowIso(),
@@ -484,15 +615,15 @@ app.post("/api/notes/:id/threads/:threadId/replies", requireOwnerApi, (req, res)
     return;
   }
 
-  const bearer = getBearerToken(req);
-  const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
-  const authorName = apiKeyLabel || "Owner";
+  const identity = getRequestIdentity(req);
+  const authorName = identity.username || "Owner";
+  const authorId = identity.userId || "__owner__";
   const timestamp = nowIso();
 
   thread.messages.push({
     id: createId(10),
     parentId: parentMessageId,
-    authorId: "__owner__",
+    authorId,
     authorName,
     body,
     createdAt: timestamp,
@@ -1100,7 +1231,8 @@ wss.on("connection", (ws, req) => {
 
     const clientId = `c${++clientIdCounter}`;
     const color = CURSOR_COLORS[nextColorIndex++ % CURSOR_COLORS.length];
-    const conn: ClientConn = { ws, kind: "editor", noteId: note.id, shareId: note.shareId, clientId, name: "Owner", color, alive: true };
+    const identity = getRequestIdentityFromHeaders(req.headers);
+    const conn: ClientConn = { ws, kind: "editor", noteId: note.id, shareId: note.shareId, clientId, name: identity.username || "Owner", color, alive: true };
     clients.push(conn);
     sendServerMessage(ws, { ...buildHelloMessage(note), clientId });
     sendExistingPresence(conn);
@@ -1557,10 +1689,13 @@ function buildViewerInfo(
   overrides?: { commenterNameOverride?: string; hasCommenterIdentityOverride?: boolean },
 ): ViewerInfo {
   const commenter = getCommenterIdentity(req);
+  const identity = getRequestIdentity(req);
   return {
-    isOwner: isOwnerAuthenticated(req),
+    isOwner: identity.kind !== null,
     commenterName: overrides?.commenterNameOverride ?? commenter.name,
     hasCommenterIdentity: overrides?.hasCommenterIdentityOverride ?? Boolean(commenter.id),
+    username: identity.kind !== null ? identity.username : null,
+    role: identity.role,
   };
 }
 
@@ -1784,33 +1919,128 @@ function saveAuthData(authData: AuthData) {
 
 function authConfigured() {
   const auth = loadAuthData();
+  if (auth?.users && auth.users.length > 0) {
+    return true;
+  }
+  // Legacy single-password instances are configured too (migrated lazily on first user login)
   return Boolean(auth?.passwordSalt && auth?.passwordHash);
+}
+
+function findUserByUsername(username: string): UserRecord | null {
+  const auth = loadAuthData();
+  const users = auth?.users || [];
+  const normalized = username.trim().toLowerCase();
+  return users.find((user) => user.username.toLowerCase() === normalized) || null;
+}
+
+function findUserById(userId: string): UserRecord | null {
+  const auth = loadAuthData();
+  return (auth?.users || []).find((user) => user.id === userId) || null;
 }
 
 function passwordMatches(password: string) {
   const auth = loadAuthData();
-  if (!auth) {
+  if (!auth || !auth.passwordSalt || !auth.passwordHash) {
     return false;
   }
 
   return secureEqualsHex(hashSecret(password, auth.passwordSalt), auth.passwordHash);
 }
 
-function initializeOwnerAuth(password: string) {
+function userPasswordMatches(user: UserRecord, password: string) {
+  return secureEqualsHex(hashSecret(password, user.passwordSalt), user.passwordHash);
+}
+
+function migrateLegacyAuthIfNeeded(): AuthData {
+  // Convert an old single-password instance: create one admin user "owner"
+  // carrying the same password; existing device tokens and API keys keep working
+  // (mapped to that user on lookup).
+  const auth = loadAuthData();
+  if (!auth || auth.users) {
+    return auth as AuthData;
+  }
+  if (!auth.passwordSalt || !auth.passwordHash) {
+    return auth as AuthData;
+  }
+
+  const owner: UserRecord = {
+    id: "u_owner",
+    username: "owner",
+    passwordSalt: auth.passwordSalt,
+    passwordHash: auth.passwordHash,
+    role: "admin",
+    active: true,
+    createdAt: nowIso(),
+  };
+  const migrated: AuthData = { ...auth, users: [owner] };
+  saveAuthData(migrated);
+  return migrated;
+}
+
+function createUser(username: string, password: string, role: UserRole): UserRecord | { error: string } {
+  let auth = loadAuthData();
+  if (!auth) {
+    auth = { tokens: [] };
+  }
+  const normalized = username.trim();
+  if (!/^[a-zA-Z0-9_.-]{2,32}$/.test(normalized)) {
+    return { error: "Username: 2-32 characters, letters/digits/_/-/. only." };
+  }
+  if (findUserByUsername(normalized)) {
+    return { error: "Username already taken." };
+  }
+  if (password.length < 8) {
+    return { error: "Password must be at least 8 characters." };
+  }
+
   const salt = crypto.randomBytes(16).toString("hex");
-  const auth: AuthData = {
+  const user: UserRecord = {
+    id: `u_${createId(10)}`,
+    username: normalized,
     passwordSalt: salt,
     passwordHash: hashSecret(password, salt),
+    role,
+    active: true,
+    createdAt: nowIso(),
+  };
+  auth.users = [...(auth.users || []), user];
+  saveAuthData(auth);
+  return user;
+}
+
+function initializeOwnerAuth(password: string) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const firstAdmin: UserRecord = {
+    id: `u_${createId(10)}`,
+    username: "admin",
+    passwordSalt: salt,
+    passwordHash: hashSecret(password, salt),
+    role: "admin",
+    active: true,
+    createdAt: nowIso(),
+  };
+  const auth: AuthData = {
     tokens: [],
+    users: [firstAdmin],
   };
   saveAuthData(auth);
-  return issueOwnerToken();
+  return issueSessionToken(firstAdmin.id);
 }
 
 function issueOwnerToken() {
+  // Legacy helper: issues a session for the first admin (used only by legacy paths)
+  const auth = loadAuthData();
+  const admin = (auth?.users || []).find((user) => user.role === "admin");
+  if (!admin) {
+    throw new Error("No admin user configured.");
+  }
+  return issueSessionToken(admin.id);
+}
+
+function issueSessionToken(userId: string) {
   const auth = loadAuthData();
   if (!auth) {
-    throw new Error("Password not configured.");
+    throw new Error("Auth not configured.");
   }
 
   const token = crypto.randomBytes(32).toString("base64url");
@@ -1818,6 +2048,7 @@ function issueOwnerToken() {
   const timestamp = nowIso();
   auth.tokens.push({
     id: createId(10),
+    userId,
     salt,
     hash: hashSecret(token, salt),
     createdAt: timestamp,
@@ -1827,28 +2058,47 @@ function issueOwnerToken() {
   return token;
 }
 
-function verifyOwnerToken(token: string) {
+function findSession(token: string): DeviceToken | null {
   const auth = loadAuthData();
   if (!auth) {
+    return null;
+  }
+  for (const stored of auth.tokens) {
+    if (secureEqualsHex(hashSecret(token, stored.salt), stored.hash)) {
+      return stored;
+    }
+  }
+  return null;
+}
+
+function resolveSessionUserId(stored: DeviceToken): string | null {
+  if (stored.userId) {
+    return stored.userId;
+  }
+  // Legacy token from the single-password era: belongs to the migrated admin
+  const auth = loadAuthData();
+  const admin = (auth?.users || []).find((user) => user.role === "admin");
+  return admin ? admin.id : null;
+}
+
+function verifyOwnerToken(token: string) {
+  const stored = findSession(token);
+  if (!stored) {
     return false;
   }
 
-  let changed = false;
-  for (const stored of auth.tokens) {
-    if (secureEqualsHex(hashSecret(token, stored.salt), stored.hash)) {
-      const lastSeen = Date.parse(stored.lastUsedAt);
-      if (Number.isNaN(lastSeen) || Date.now() - lastSeen > 1000 * 60 * 60 * 12) {
-        stored.lastUsedAt = nowIso();
-        changed = true;
-      }
-      if (changed) {
-        saveAuthData(auth);
-      }
-      return true;
-    }
+  const userId = resolveSessionUserId(stored);
+  const user = userId ? findUserById(userId) : null;
+  if (!user || !user.active) {
+    return false;
   }
 
-  return false;
+  const lastSeen = Date.parse(stored.lastUsedAt);
+  if (Number.isNaN(lastSeen) || Date.now() - lastSeen > 1000 * 60 * 60 * 12) {
+    stored.lastUsedAt = nowIso();
+    saveAuthData(loadAuthData() as AuthData);
+  }
+  return true;
 }
 
 function revokeOwnerToken(token: string) {
@@ -1860,6 +2110,18 @@ function revokeOwnerToken(token: string) {
   const tokens = auth.tokens.filter((stored) => !secureEqualsHex(hashSecret(token, stored.salt), stored.hash));
   if (tokens.length !== auth.tokens.length) {
     auth.tokens = tokens;
+    saveAuthData(auth);
+  }
+}
+
+function revokeUserSessions(userId: string) {
+  const auth = loadAuthData();
+  if (!auth) {
+    return;
+  }
+  const before = auth.tokens.length;
+  auth.tokens = auth.tokens.filter((stored) => resolveSessionUserId(stored) !== userId);
+  if (auth.tokens.length !== before) {
     saveAuthData(auth);
   }
 }
@@ -1942,49 +2204,147 @@ function isOwnerAuthenticatedHeaders(headers: http.IncomingHttpHeaders) {
   return Boolean(token && verifyOwnerToken(token));
 }
 
+type RequestIdentity = {
+  kind: "user" | "apikey" | null;
+  userId: string | null;
+  username: string;   // display name for authorship
+  role: UserRole | null;
+};
+
+function getRequestIdentity(req: Request): RequestIdentity {
+  const bearer = getBearerToken(req);
+  if (bearer) {
+    const apiKey = findApiKey(bearer);
+    if (apiKey) {
+      const userId = apiKey.userId || null;
+      const user = userId ? findUserById(userId) : null;
+      if (user && !user.active) {
+        return { kind: null, userId: null, username: "", role: null };
+      }
+      return {
+        kind: "apikey",
+        userId,
+        username: user ? user.username : apiKey.label,
+        role: user?.role || "editor",
+      };
+    }
+
+    // Bearer may also carry a session token (login response token used directly)
+    const stored = findSession(bearer);
+    if (stored) {
+      const userId = resolveSessionUserId(stored);
+      const user = userId ? findUserById(userId) : null;
+      if (user && user.active) {
+        return { kind: "user", userId: user.id, username: user.username, role: user.role };
+      }
+    }
+  }
+
+  const token = getOwnerSessionTokenFromHeaders(req.headers);
+  if (token) {
+    const stored = findSession(token);
+    if (stored) {
+      const userId = resolveSessionUserId(stored);
+      const user = userId ? findUserById(userId) : null;
+      if (user && user.active) {
+        return { kind: "user", userId: user.id, username: user.username, role: user.role };
+      }
+    }
+  }
+
+  return { kind: null, userId: null, username: "", role: null };
+}
+
+function getRequestIdentityFromHeaders(headers: http.IncomingHttpHeaders): RequestIdentity {
+  const bearer = getBearerTokenFromHeaders(headers);
+  if (bearer) {
+    const apiKey = findApiKey(bearer);
+    if (apiKey) {
+      const userId = apiKey.userId || null;
+      const user = userId ? findUserById(userId) : null;
+      if (user && !user.active) {
+        return { kind: null, userId: null, username: "", role: null };
+      }
+      return {
+        kind: "apikey",
+        userId,
+        username: user ? user.username : apiKey.label,
+        role: user?.role || "editor",
+      };
+    }
+
+    const stored = findSession(bearer);
+    if (stored) {
+      const userId = resolveSessionUserId(stored);
+      const user = userId ? findUserById(userId) : null;
+      if (user && user.active) {
+        return { kind: "user", userId: user.id, username: user.username, role: user.role };
+      }
+    }
+  }
+
+  const token = getOwnerSessionTokenFromHeaders(headers);
+  if (token) {
+    const stored = findSession(token);
+    if (stored) {
+      const userId = resolveSessionUserId(stored);
+      const user = userId ? findUserById(userId) : null;
+      if (user && user.active) {
+        return { kind: "user", userId: user.id, username: user.username, role: user.role };
+      }
+    }
+  }
+
+  return { kind: null, userId: null, username: "", role: null };
+}
+
 function isOwnerAuthenticated(req: Request) {
-  return isOwnerAuthenticatedHeaders(req.headers);
+  return getRequestIdentity(req).kind !== null;
 }
 
 function isOwnerAuthenticatedIncomingRequest(req: http.IncomingMessage) {
-  return isOwnerAuthenticatedHeaders(req.headers);
+  return getRequestIdentityFromHeaders(req.headers).kind !== null;
+}
+
+function requireAdminApi(req: Request, res: Response, next: NextFunction) {
+  const identity = getRequestIdentity(req);
+  if (identity.kind === null) {
+    res.status(401).json({ ok: false, error: "Unauthorized." });
+    return;
+  }
+  if (identity.role !== "admin") {
+    res.status(403).json({ ok: false, error: "Admin role required." });
+    return;
+  }
+  next();
 }
 
 function getBearerToken(req: Request) {
   return getBearerTokenFromHeaders(req.headers);
 }
 
-function verifyApiKey(key: string) {
-  const auth = loadAuthData();
-  if (!auth || !auth.apiKeys) {
-    return false;
-  }
-
-  for (const stored of auth.apiKeys) {
-    if (secureEqualsHex(hashSecret(key, stored.keySalt), stored.keyHash)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function getApiKeyLabel(key: string): string | null {
+function findApiKey(key: string): ApiKey | null {
   const auth = loadAuthData();
   if (!auth || !auth.apiKeys) {
     return null;
   }
-
   for (const stored of auth.apiKeys) {
     if (secureEqualsHex(hashSecret(key, stored.keySalt), stored.keyHash)) {
-      return stored.label;
+      return stored;
     }
   }
-
   return null;
 }
 
-function createApiKey(label: string) {
+function verifyApiKey(key: string) {
+  return findApiKey(key) !== null;
+}
+
+function getApiKeyLabel(key: string): string | null {
+  return findApiKey(key)?.label || null;
+}
+
+function createApiKey(label: string, creatorUserId?: string | null) {
   const auth = loadAuthData();
   if (!auth) {
     throw new Error("Password not configured.");
@@ -1994,11 +2354,18 @@ function createApiKey(label: string) {
     auth.apiKeys = [];
   }
 
+  let userId: string | undefined = creatorUserId || undefined;
+  if (!userId) {
+    const admin = (auth.users || []).find((user) => user.role === "admin");
+    userId = admin ? admin.id : undefined;
+  }
+
   const rawKey = crypto.randomBytes(32).toString("base64url");
   const salt = crypto.randomBytes(16).toString("hex");
   const apiKey: ApiKey = {
     id: createId(10),
     label: label.trim().slice(0, 80) || "unnamed",
+    userId,
     keySalt: salt,
     keyHash: hashSecret(rawKey, salt),
     createdAt: nowIso(),
@@ -2063,7 +2430,8 @@ function setCommenterNameCookie(req: Request, res: Response, name: string) {
 
 function ensureCommentAuthor(req: Request, res: Response) {
   if (isOwnerAuthenticated(req)) {
-    return { authorId: "__owner__", authorName: "Owner" };
+    const identity = getRequestIdentity(req);
+    return { authorId: identity.userId || "__owner__", authorName: identity.username || "Owner" };
   }
 
   const commenter = getCommenterIdentity(req);
@@ -2115,12 +2483,12 @@ function renderSimplePage(title: string, body: string) {
 }
 
 function renderAuthPage(mode: "login" | "setup") {
-  const title = mode === "setup" ? "Set password" : "Sign in";
-  const heading = mode === "setup" ? "Set the password" : "Enter the password";
+  const title = mode === "setup" ? "Create admin account" : "Sign in";
+  const heading = mode === "setup" ? "Set up the first account" : "Sign in";
   const hint =
     mode === "setup"
-      ? "First startup. This becomes the single owner password for the instance."
-      : "This instance uses one password and per-device tokens.";
+      ? "First startup. This becomes the admin account for the instance."
+      : "Sign in with your username and password.";
 
   return `<!doctype html>
 <html lang="en">
@@ -2138,14 +2506,15 @@ function renderAuthPage(mode: "login" | "setup") {
       <p class="auth-hint">${hint}</p>
       <p class="auth-error hidden" id="auth-error"></p>
       <form id="auth-form" class="auth-form">
-        <input id="password" name="password" type="password" autocomplete="${mode === "setup" ? "new-password" : "current-password"}" placeholder="Password" minlength="8" required autofocus />
+        <input id="username" name="username" type="text" autocomplete="username" placeholder="Username" ${mode === "setup" ? "" : "autofocus"} required />
+        <input id="password" name="password" type="password" autocomplete="${mode === "setup" ? "new-password" : "current-password"}" placeholder="Password" minlength="8" ${mode === "setup" ? "autofocus" : ""} required />
         ${
           mode === "setup"
             ? '<input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" placeholder="Confirm password" minlength="8" required />'
             : ""
         }
         <div class="auth-actions">
-          <button type="submit">${mode === "setup" ? "Save password" : "Sign in"}</button>
+          <button type="submit">${mode === "setup" ? "Create account" : "Sign in"}</button>
         </div>
       </form>
     </main>

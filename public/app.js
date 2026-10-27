@@ -194,13 +194,20 @@
 
     loadNotes("");
 
-    function openSettingsModal() {
+    async function openSettingsModal() {
       listModalBackdrop.classList.remove("hidden");
       listModalBackdrop.innerHTML = `
         <div class="modal settings-modal" role="dialog" aria-modal="true">
           <div class="settings-header">
             <h2 class="settings-title">Settings</h2>
             <jot-icon-button icon="close" label="Close" id="settingsClose"></jot-icon-button>
+          </div>
+          <div class="settings-section" id="usersSection" style="display:none">
+            <div class="settings-section-header">
+              <h3 class="settings-section-title">Users</h3>
+              <jot-button variant="ghost" size="sm" id="createUserButton">+ new user</jot-button>
+            </div>
+            <div id="usersList"></div>
           </div>
           <div class="settings-section">
             <div class="settings-section-header">
@@ -276,6 +283,96 @@
       }
 
       renderKeys();
+
+      // ── Users section (admin only) ──
+      const usersSection = document.getElementById("usersSection");
+      const usersList = document.getElementById("usersList");
+      const createUserButton = document.getElementById("createUserButton");
+
+      let me = null;
+      try {
+        const usersResponse = await api("/api/users");
+        me = usersResponse.me;
+        usersSection.style.display = "";
+        renderUsers(usersResponse.users);
+      } catch {
+        // Not admin (403) — section stays hidden
+      }
+
+      function renderUsers(users) {
+        usersList.innerHTML = users.map((user) => `
+            <div class="api-key-row" data-user-id="${escapeHtml(user.id)}">
+              <div class="api-key-info">
+                <span class="api-key-label">${escapeHtml(user.username)}${user.id === me ? ' <span class="user-badge">you</span>' : ""}${user.role === "admin" ? ' <span class="user-badge">admin</span>' : ""}${!user.active ? ' <span class="user-badge user-inactive">inactive</span>' : ""}</span>
+                <span class="api-key-meta">${escapeHtml(formatDate(user.createdAt))}</span>
+              </div>
+              <div>
+                ${user.id !== me ? `<jot-icon-button icon="edit" label="Reset password" data-reset-password="${escapeHtml(user.id)}" size="sm"></jot-icon-button>` : ""}
+                ${user.id !== me ? `<jot-icon-button icon="${user.active ? "undo" : "check"}" label="${user.active ? "Deactivate" : "Activate"}" data-toggle-active="${escapeHtml(user.id)}" data-next-active="${user.active ? "false" : "true"}" size="sm"></jot-icon-button>` : ""}
+                ${user.id !== me ? `<jot-icon-button icon="trash" label="Delete user" data-delete-user="${escapeHtml(user.id)}" size="sm" danger></jot-icon-button>` : ""}
+              </div>
+            </div>
+          `).join("");
+      }
+
+      async function refreshUsers() {
+        try {
+          const response = await api("/api/users");
+          me = response.me;
+          renderUsers(response.users);
+        } catch {}
+      }
+
+      createUserButton.addEventListener("click", async () => {
+        const username = prompt("Username for the new user:");
+        if (!username) return;
+        const password = prompt(`Password for ${username} (min 8 chars):`);
+        if (!password) return;
+        const role = confirm(`Make "${username}" an admin? (Cancel = editor)`) ? "admin" : "editor";
+        try {
+          await api("/api/users", { method: "POST", body: { username, password, role } });
+          await refreshUsers();
+        } catch (error) {
+          alert(error.message || "Failed to create user.");
+        }
+      });
+
+      usersList.addEventListener("click", async (event) => {
+        const resetBtn = event.target.closest("[data-reset-password]");
+        if (resetBtn) {
+          const password = prompt("New password (min 8 chars):");
+          if (!password) return;
+          try {
+            await api(`/api/users/${resetBtn.dataset.resetPassword}/password`, { method: "POST", body: { password } });
+            alert("Password reset. The user's sessions were revoked.");
+          } catch (error) {
+            alert(error.message || "Failed to reset password.");
+          }
+          return;
+        }
+
+        const toggleBtn = event.target.closest("[data-toggle-active]");
+        if (toggleBtn) {
+          try {
+            await api(`/api/users/${toggleBtn.dataset.toggleActive}/active`, { method: "POST", body: { active: toggleBtn.dataset.nextActive === "true" } });
+            await refreshUsers();
+          } catch (error) {
+            alert(error.message || "Failed to update user.");
+          }
+          return;
+        }
+
+        const deleteBtn = event.target.closest("[data-delete-user]");
+        if (deleteBtn) {
+          if (!confirm("Delete this user? Their comments and threads stay (attribution is preserved).")) return;
+          try {
+            await api(`/api/users/${deleteBtn.dataset.deleteUser}`, { method: "DELETE" });
+            await refreshUsers();
+          } catch (error) {
+            alert(error.message || "Failed to delete user.");
+          }
+        }
+      });
     }
 
     async function loadNotes(query) {
@@ -431,7 +528,7 @@
         collabEditor = createCollabEditor(editorTextarea, {
           noteId: isPublic ? undefined : noteId,
           shareId: isPublic ? shareId : undefined,
-          name: isPublic ? (state.viewer?.commenterName || "Anonymous") : "Owner",
+          name: isPublic ? (state.viewer?.commenterName || "Anonymous") : (state.viewer?.username || "Owner"),
           onReady: (payload) => {
             state.note = {
               ...(state.note || {}),
